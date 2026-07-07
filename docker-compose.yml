@@ -1,0 +1,82 @@
+# 三種環境: single / sentinel / cluster
+# 用 profile 隔開, 一次起一種:
+#   docker compose --profile single up -d
+#   docker compose --profile sentinel up -d
+#   docker compose --profile cluster up -d
+services:
+  # ---------- single ----------
+  redis:
+    image: redis:7
+    profiles: ["single"]
+    # 只綁 127.0.0.1 → 只有本機連得到, 網際網路碰不到 (原本 "6379:6379" = 0.0.0.0 全開, 會被掃)
+    # requirepass: 縱深防禦, 就算 port 意外開放也要密碼 (換成你自己的強密碼)
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru --requirepass devpass_change_me
+    ports: ["127.0.0.1:6379:6379"]
+
+  redisinsight:
+    image: redis/redisinsight:latest
+    profiles: ["single"]
+    ports: ["127.0.0.1:5540:5540"]
+
+  # ---------- sentinel (1 master + 2 replica + 3 sentinel) ----------
+  master:
+    image: redis:7
+    profiles: ["sentinel"]
+    command: redis-server --appendonly yes
+    ports: ["6380:6379"]
+
+  replica1:
+    image: redis:7
+    profiles: ["sentinel"]
+    command: redis-server --replicaof master 6379
+    depends_on: [master]
+
+  replica2:
+    image: redis:7
+    profiles: ["sentinel"]
+    command: redis-server --replicaof master 6379
+    depends_on: [master]
+
+  sentinel1:
+    image: redis:7
+    profiles: ["sentinel"]
+    command: >
+      sh -c 'echo "sentinel monitor mymaster master 6379 2
+      sentinel down-after-milliseconds mymaster 5000
+      sentinel failover-timeout mymaster 10000" > /tmp/s.conf
+      && redis-sentinel /tmp/s.conf'
+    depends_on: [master]
+    ports: ["26379:26379"]
+
+  sentinel2:
+    image: redis:7
+    profiles: ["sentinel"]
+    command: >
+      sh -c 'echo "sentinel monitor mymaster master 6379 2
+      sentinel down-after-milliseconds mymaster 5000
+      sentinel failover-timeout mymaster 10000" > /tmp/s.conf
+      && redis-sentinel /tmp/s.conf'
+    depends_on: [master]
+
+  sentinel3:
+    image: redis:7
+    profiles: ["sentinel"]
+    command: >
+      sh -c 'echo "sentinel monitor mymaster master 6379 2
+      sentinel down-after-milliseconds mymaster 5000
+      sentinel failover-timeout mymaster 10000" > /tmp/s.conf
+      && redis-sentinel /tmp/s.conf'
+    depends_on: [master]
+
+  # ---------- cluster (6 nodes, 3 master + 3 replica) ----------
+  # 起完要跑一次:
+  #   docker compose --profile cluster exec node1 \
+  #     redis-cli --cluster create \
+  #     node1:6379 node2:6379 node3:6379 node4:6379 node5:6379 node6:6379 \
+  #     --cluster-replicas 1 --cluster-yes
+  node1: { image: redis:7, profiles: ["cluster"], command: redis-server --cluster-enabled yes --cluster-config-file nodes.conf --cluster-node-timeout 5000 --appendonly yes, ports: ["7001:6379"] }
+  node2: { image: redis:7, profiles: ["cluster"], command: redis-server --cluster-enabled yes --cluster-config-file nodes.conf --cluster-node-timeout 5000 --appendonly yes, ports: ["7002:6379"] }
+  node3: { image: redis:7, profiles: ["cluster"], command: redis-server --cluster-enabled yes --cluster-config-file nodes.conf --cluster-node-timeout 5000 --appendonly yes, ports: ["7003:6379"] }
+  node4: { image: redis:7, profiles: ["cluster"], command: redis-server --cluster-enabled yes --cluster-config-file nodes.conf --cluster-node-timeout 5000 --appendonly yes, ports: ["7004:6379"] }
+  node5: { image: redis:7, profiles: ["cluster"], command: redis-server --cluster-enabled yes --cluster-config-file nodes.conf --cluster-node-timeout 5000 --appendonly yes, ports: ["7005:6379"] }
+  node6: { image: redis:7, profiles: ["cluster"], command: redis-server --cluster-enabled yes --cluster-config-file nodes.conf --cluster-node-timeout 5000 --appendonly yes, ports: ["7006:6379"] }
