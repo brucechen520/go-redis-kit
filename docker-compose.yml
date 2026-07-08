@@ -10,7 +10,7 @@ services:
     profiles: ["single"]
     # 只綁 127.0.0.1 → 只有本機連得到, 網際網路碰不到 (原本 "6379:6379" = 0.0.0.0 全開, 會被掃)
     # requirepass: 縱深防禦, 就算 port 意外開放也要密碼 (換成你自己的強密碼)
-    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru --requirepass devpass_change_me
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru --requirepass devpass_change_me --enable-debug-command yes
     ports: ["127.0.0.1:6379:6379"]
 
   redisinsight:

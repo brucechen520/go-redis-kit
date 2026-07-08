@@ -1,0 +1,13 @@
+# Go
+/bin/
+*.test
+*.out
+coverage.*
+# editor
+.idea/
+.vscode/
+.DS_Store
+# redis dumps if run locally
+dump.rdb
+appendonly*
+nodes.conf
