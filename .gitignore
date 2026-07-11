@@ -3,6 +3,9 @@
 *.test
 *.out
 coverage.*
+# stray binaries from `go build ./labs/xxx`（建議用 go run，不要 go build）
+/00-hello
+/01-string-counter
 # editor
 .idea/
 .vscode/
