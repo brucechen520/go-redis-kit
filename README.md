@@ -1,6 +1,6 @@
 # go-redis-kit
 
-我的 Redis 深入學習 repo（Go 1.26.1 · `github.com/redis/go-redis/v9`）。
+Redis notes and a Go wrapper library (rediskit, work in progress) (Go 1.26.1 · `github.com/redis/go-redis/v9`).
 
 ## 環境
 
@@ -32,4 +32,4 @@ make single-down
 
 `make help` 看全部指令。
 
-> ⚠️ redis 綁 `127.0.0.1` 且設了密碼——別讓它對公網開放。
+> ⚠️ redis 綁 `127.0.0.1` 且設了密碼。
