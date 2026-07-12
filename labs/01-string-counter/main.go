@@ -59,6 +59,11 @@ func main() {
 	// 3. List
 	demoListRecentN(ctx, rdb)
 	demoListReliableQueue(ctx, rdb)
+
+	// 4. Set
+	demoSetTags(ctx, rdb)
+	demoSetSocial(ctx, rdb)
+	demoSetLottery(ctx, rdb)
 }
 
 // 1. 併發 INCR 證明原子性 ---------------------------------------------------
@@ -362,4 +367,76 @@ func demoListReliableQueue(ctx context.Context, rdb *redis.Client) {
 func lrange(ctx context.Context, rdb *redis.Client, key string) []string {
 	v, _ := rdb.LRange(ctx, key, 0, -1).Result()
 	return v
+}
+
+// 9. Set：標籤 / 去重 / 成員檢查 ---------------------------------------------
+// 情境：文章標籤、用戶興趣、黑白名單。SADD 天生去重；SISMEMBER O(1) 查在不在
+//（權限檢查、IP 黑名單、去重都靠這個）。
+func demoSetTags(ctx context.Context, rdb *redis.Client) {
+	fmt.Println("\n=== 9. Set：標籤 / 去重 / 成員檢查 ===")
+	const key = "article:42:tags"
+	rdb.Del(ctx, key)
+
+	// SADD 去重：加 5 次（含重複）只會留不重複的
+	added, _ := rdb.SAdd(ctx, key, "go", "redis", "go", "db", "redis").Result()
+	fmt.Printf("加 5 次(含重複)，實際新增 %d 個 → %v（自動去重）\n", added, smembers(ctx, rdb, key))
+
+	// SISMEMBER：O(1) 查在不在
+	yes, _ := rdb.SIsMember(ctx, key, "go").Result()
+	no, _ := rdb.SIsMember(ctx, key, "rust").Result()
+	fmt.Printf("有 go? %v；有 rust? %v\n", yes, no)
+
+	// SCARD 數量、SREM 移除
+	cnt, _ := rdb.SCard(ctx, key).Result()
+	rdb.SRem(ctx, key, "db")
+	fmt.Printf("標籤數=%d，移除 db 後=%v\n", cnt, smembers(ctx, rdb, key))
+}
+
+// 10. Set：共同好友 / 好友推薦（交集、差集）----------------------------------
+// 情境：社群「共同好友」= 兩人好友集合的交集（SINTER）；
+//「可能認識的人」= 差集（SDIFF，他有你沒有）。
+func demoSetSocial(ctx context.Context, rdb *redis.Client) {
+	fmt.Println("\n=== 10. Set：共同好友 SINTER / 好友推薦 SDIFF ===")
+	const alice, bob = "friends:alice", "friends:bob"
+	rdb.Del(ctx, alice, bob)
+	rdb.SAdd(ctx, alice, "u1", "u2", "u3", "u4")
+	rdb.SAdd(ctx, bob, "u3", "u4", "u5", "u6")
+
+	common, _ := rdb.SInter(ctx, alice, bob).Result() // 交集 = 共同好友
+	fmt.Printf("alice ∩ bob 共同好友 = %v\n", common)
+
+	recommend, _ := rdb.SDiff(ctx, bob, alice).Result() // bob 有、alice 沒有 → 推薦
+	fmt.Printf("推薦給 alice（bob 有她沒有）= %v\n", recommend)
+	fmt.Println("（⚠️ 大 set 的 SINTER/SDIFF 是 O(N)，熱點要小心或改離線算）")
+}
+
+// 11. Set：抽獎（SPOP 不重複中獎 / SRANDMEMBER 抽樣不移除）--------------------
+// 情境：抽獎池。SPOP 隨機取出「並移除」→ 同一人不會中兩次；
+// SRANDMEMBER 隨機取但「不移除」→ 適合抽樣/展示不消耗池子。
+func demoSetLottery(ctx context.Context, rdb *redis.Client) {
+	fmt.Println("\n=== 11. Set：抽獎 SPOP（不重複中獎）/ SRANDMEMBER（抽樣不移除）===")
+	const pool = "lottery:pool"
+	rdb.Del(ctx, pool)
+	for i := 1; i <= 10; i++ {
+		rdb.SAdd(ctx, pool, fmt.Sprintf("user%d", i))
+	}
+
+	preview, _ := rdb.SRandMemberN(ctx, pool, 3).Result() // 不移除
+	fmt.Printf("SRANDMEMBER 預覽 3 個（不移除）= %v，池子還剩 %d\n", preview, scard(ctx, rdb, pool))
+
+	winners, _ := rdb.SPopN(ctx, pool, 2).Result() // 移除 → 不重複中獎
+	fmt.Printf("SPOP 抽 2 位中獎（移除）= %v，池子剩 %d\n", winners, scard(ctx, rdb, pool))
+	fmt.Println("→ SPOP 中獎即移除，同一人不會中兩次；SRANDMEMBER 只抽樣不動池子")
+
+	rdb.Del(ctx, pool)
+}
+
+func smembers(ctx context.Context, rdb *redis.Client, key string) []string {
+	v, _ := rdb.SMembers(ctx, key).Result()
+	return v
+}
+
+func scard(ctx context.Context, rdb *redis.Client, key string) int64 {
+	n, _ := rdb.SCard(ctx, key).Result()
+	return n
 }

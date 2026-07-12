@@ -895,22 +895,33 @@ List 底層是**鏈結串列（quicklist）**，不是陣列。取任意 index i
 
 ### Go 範例
 
+可跑版見 `labs/01-string-counter` demo 9/10/11。對應三個實際情境：
+
 ```go
 ctx := context.Background()
 rdb := redis.NewClient(&redis.Options{Addr: "127.0.0.1:6379"})
 
-rdb.SAdd(ctx, "user:A:friends", 1, 2, 3, 4)
-rdb.SAdd(ctx, "user:B:friends", 3, 4, 5, 6)
+// 情境 1：標籤 / 去重 / 成員檢查（文章標籤、用戶興趣、黑白名單）
+rdb.SAdd(ctx, "article:42:tags", "go", "redis", "go") // 自動去重 → {go, redis}
+yes, _ := rdb.SIsMember(ctx, "article:42:tags", "go").Result() // O(1) 查在不在
+_ = yes                                                        // 權限/黑名單檢查都靠這
+rdb.SCard(ctx, "article:42:tags")                              // 數量
+rdb.SRem(ctx, "article:42:tags", "go")                        // 移除
 
-// 共同好友
-common, _ := rdb.SInter(ctx, "user:A:friends", "user:B:friends").Result()
-fmt.Println("common friends:", common) // [3 4]
+// 情境 2：共同好友（交集）/ 好友推薦（差集）
+rdb.SAdd(ctx, "friends:A", "u1", "u2", "u3", "u4")
+rdb.SAdd(ctx, "friends:B", "u3", "u4", "u5", "u6")
+common, _ := rdb.SInter(ctx, "friends:A", "friends:B").Result()    // 共同好友 {u3,u4}
+recommend, _ := rdb.SDiff(ctx, "friends:B", "friends:A").Result()  // 推薦給 A {u5,u6}
+n, _ := rdb.SInterCard(ctx, 0, "friends:A", "friends:B").Result()  // 只要交集數量（省傳輸）
+_, _, _ = common, recommend, n
 
-// 只要數量
-n, _ := rdb.SInterCard(ctx, 0, "user:A:friends", "user:B:friends").Result()
-fmt.Println("count:", n)
+// 情境 3：抽獎（SPOP 中獎即移除，不重複中獎 / SRANDMEMBER 抽樣不移除）
+rdb.SAdd(ctx, "lottery:pool", "user1", "user2" /* ... */)
+rdb.SRandMemberN(ctx, "lottery:pool", 3) // 抽樣預覽，不動池子
+rdb.SPopN(ctx, "lottery:pool", 2)        // 抽 2 位中獎並移除 → 同一人不會中兩次
 
-// 大 set 用 SSCAN
+// 大 set 一律用 SSCAN 游標分批（別 SMEMBERS 全撈，O(N) 卡全庫）
 var cursor uint64
 for {
 	members, next, err := rdb.SScan(ctx, "big:set", cursor, "*", 200).Result()
@@ -919,11 +930,13 @@ for {
 	}
 	_ = members
 	cursor = next
-	if cursor == 0 {
+	if cursor == 0 { // cursor 回 0 才結束
 		break
 	}
 }
 ```
+
+**實際情境**：去重（UV 精確去重，量大改 HyperLogLog）、標籤 / 興趣集合、黑白名單（`SISMEMBER` O(1)）、共同好友 / 推薦（`SINTER` / `SDIFF`）、抽獎（`SPOP` 不重複中獎）、隨機抽樣（`SRANDMEMBER`）。**大 set 遍歷用 `SSCAN`；`SINTER`/`SDIFF`/`SUNION` 對大集合是 O(N)，熱點要小心或改離線算。**
 
 ### 專案流程說明：實作「共同好友推薦」
 
