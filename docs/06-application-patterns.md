@@ -1026,6 +1026,124 @@ func AllowLeakyBucket(ctx context.Context, rdb *redis.Client, key string, capaci
 - **內部服務、量大、可容忍邊界瑕疵、追求極簡** → **固定窗口**。
 - 不確定就選令牌桶，它是綜合體驗最好的預設值。
 
+### 3.6 可跑 lab 範例（demo 風格，對齊 `labs/01-string-counter`）
+
+把三個主要算法收成一支可跑的 demo：各自狂送 8 次請求（上限 5），看放行/擋下。可存成 `labs/02-rate-limit/main.go` 直接 `go run`。
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"os"
+	"time"
+
+	"github.com/redis/go-redis/v9"
+)
+
+func env(k, d string) string {
+	if v := os.Getenv(k); v != "" {
+		return v
+	}
+	return d
+}
+
+func main() {
+	ctx := context.Background()
+	rdb := redis.NewClient(&redis.Options{
+		Addr:     env("REDIS_ADDR", "127.0.0.1:6379"),
+		Password: env("REDIS_PASSWORD", "devpass_change_me"),
+	})
+	defer rdb.Close()
+	if err := rdb.Ping(ctx).Err(); err != nil {
+		log.Fatalf("連不上 redis：%v（先 make single-up；密碼用 REDIS_PASSWORD 覆寫）", err)
+	}
+
+	demoFixedWindow(ctx, rdb)
+	demoSlidingWindow(ctx, rdb)
+	demoTokenBucket(ctx, rdb)
+}
+
+// 1. 固定窗口：INCR + 首次 EXPIRE，超過上限就擋（有邊界雙倍突發問題）
+var fixedWindowScript = redis.NewScript(`
+local c = redis.call('INCR', KEYS[1])
+if c == 1 then redis.call('EXPIRE', KEYS[1], ARGV[1]) end
+return c`)
+
+func demoFixedWindow(ctx context.Context, rdb *redis.Client) {
+	fmt.Println("\n=== 1. 固定窗口（每窗上限 5）===")
+	const key, window, limit = "rl:fixed:u1", 60, 5
+	rdb.Del(ctx, key)
+	for i := 1; i <= 8; i++ {
+		c, _ := fixedWindowScript.Run(ctx, rdb, []string{key}, window).Int()
+		fmt.Printf("第 %d 次：count=%d → %s\n", i, c, allow(c <= limit))
+	}
+}
+
+// 2. 滑動窗口（ZSet）：清窗外 → 數當前 → 未滿才加入。member 唯一（now_ms:i）
+var slidingWindowScript = redis.NewScript(`
+redis.call('ZREMRANGEBYSCORE', KEYS[1], 0, ARGV[1]-ARGV[2])  -- 清掉 window 之前的
+local n = redis.call('ZCARD', KEYS[1])
+if n < tonumber(ARGV[3]) then
+  redis.call('ZADD', KEYS[1], ARGV[1], ARGV[4])
+  redis.call('PEXPIRE', KEYS[1], ARGV[2])
+  return 1
+end
+return 0`)
+
+func demoSlidingWindow(ctx context.Context, rdb *redis.Client) {
+	fmt.Println("\n=== 2. 滑動窗口 ZSet（60s 內上限 5）===")
+	const key = "rl:slide:u1"
+	const windowMs, limit = 60000, 5
+	rdb.Del(ctx, key)
+	for i := 1; i <= 8; i++ {
+		now := time.Now().UnixMilli()
+		member := fmt.Sprintf("%d:%d", now, i) // 唯一 member，避免同毫秒覆蓋
+		ok, _ := slidingWindowScript.Run(ctx, rdb, []string{key},
+			now, windowMs, limit, member).Int()
+		fmt.Printf("第 %d 次 → %s\n", i, allow(ok == 1))
+	}
+}
+
+// 3. 令牌桶：惰性補充（capacity=5、rate=1/s），一次把攢的令牌用掉、之後回歸勻速
+var tokenBucketScript = redis.NewScript(`
+local capacity = tonumber(ARGV[1])
+local rate     = tonumber(ARGV[2])
+local now      = tonumber(ARGV[3])
+local b = redis.call('HMGET', KEYS[1], 'tokens', 'ts')
+local tokens = tonumber(b[1]) or capacity
+local ts     = tonumber(b[2]) or now
+tokens = math.min(capacity, tokens + (now - ts) / 1000 * rate)  -- 依經過時間補充
+local allowed = 0
+if tokens >= 1 then tokens = tokens - 1; allowed = 1 end
+redis.call('HMSET', KEYS[1], 'tokens', tokens, 'ts', now)
+redis.call('PEXPIRE', KEYS[1], math.ceil(capacity / rate * 1000))
+return allowed`)
+
+func demoTokenBucket(ctx context.Context, rdb *redis.Client) {
+	fmt.Println("\n=== 3. 令牌桶（容量 5、每秒補 1）===")
+	const key, capacity, rate = "rl:tb:u1", 5, 1
+	rdb.Del(ctx, key)
+	// 一開始桶滿（5 個令牌）→ 前 5 次放行（吃掉攢的突發），之後沒補上就擋
+	for i := 1; i <= 8; i++ {
+		now := time.Now().UnixMilli()
+		ok, _ := tokenBucketScript.Run(ctx, rdb, []string{key}, capacity, rate, now).Int()
+		fmt.Printf("第 %d 次 → %s\n", i, allow(ok == 1))
+	}
+}
+
+func allow(ok bool) string {
+	if ok {
+		return "允許"
+	}
+	return "擋下"
+}
+```
+
+跑起來會看到：三種算法在「8 次請求、上限 5」下都是**前 5 次放行、後 3 次擋下**；差別在**時間拉長後的行為**——固定窗口整窗重置（有邊界雙倍突發）、滑動窗口逐筆滑出、令牌桶按 `rate` 勻速補回。想觀察差異可在迴圈中間 `time.Sleep` 幾秒再送，令牌桶會補回部分額度、固定窗口要整窗到期才重置。
+
 ---
 
 ## 4. Token / 認證

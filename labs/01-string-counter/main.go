@@ -64,6 +64,11 @@ func main() {
 	demoSetTags(ctx, rdb)
 	demoSetSocial(ctx, rdb)
 	demoSetLottery(ctx, rdb)
+
+	// 5. Rate Limit 三算法
+	demoRLFixedWindow(ctx, rdb)
+	demoRLSlidingWindow(ctx, rdb)
+	demoRLTokenBucket(ctx, rdb)
 }
 
 // 1. 併發 INCR 證明原子性 ---------------------------------------------------
@@ -439,4 +444,81 @@ func smembers(ctx context.Context, rdb *redis.Client, key string) []string {
 func scard(ctx context.Context, rdb *redis.Client, key string) int64 {
 	n, _ := rdb.SCard(ctx, key).Result()
 	return n
+}
+
+// ── 限流三算法（固定窗 / 滑動窗 / 令牌桶）────────────────────────────────────
+// 三種都「8 次請求、上限 5」→ 前 5 放行、後 3 擋下。差別在時間拉長後的行為
+// （固定窗整窗重置、滑動窗逐筆滑出、令牌桶按 rate 勻速補回）。
+
+// 12. 固定窗口：INCR + 首次 EXPIRE，超過上限就擋（有邊界雙倍突發問題）
+var rlFixedScript = redis.NewScript(`
+local c = redis.call('INCR', KEYS[1])
+if c == 1 then redis.call('EXPIRE', KEYS[1], ARGV[1]) end
+return c`)
+
+func demoRLFixedWindow(ctx context.Context, rdb *redis.Client) {
+	fmt.Println("\n=== 12. 限流：固定窗口（每窗上限 5）===")
+	const key, window, limit = "rl:fixed:u1", 60, 5
+	rdb.Del(ctx, key)
+	for i := 1; i <= 8; i++ {
+		c, _ := rlFixedScript.Run(ctx, rdb, []string{key}, window).Int()
+		fmt.Printf("第 %d 次：count=%d → %s\n", i, c, allowStr(c <= limit))
+	}
+}
+
+// 13. 滑動窗口（ZSet）：清窗外 → 數當前 → 未滿才加入。member 唯一（now_ms:i）
+var rlSlidingScript = redis.NewScript(`
+redis.call('ZREMRANGEBYSCORE', KEYS[1], 0, ARGV[1]-ARGV[2])  -- 清掉 window 之前的
+local n = redis.call('ZCARD', KEYS[1])
+if n < tonumber(ARGV[3]) then
+  redis.call('ZADD', KEYS[1], ARGV[1], ARGV[4])
+  redis.call('PEXPIRE', KEYS[1], ARGV[2])
+  return 1
+end
+return 0`)
+
+func demoRLSlidingWindow(ctx context.Context, rdb *redis.Client) {
+	fmt.Println("\n=== 13. 限流：滑動窗口 ZSet（60s 內上限 5）===")
+	const key = "rl:slide:u1"
+	const windowMs, limit = 60000, 5
+	rdb.Del(ctx, key)
+	for i := 1; i <= 8; i++ {
+		now := time.Now().UnixMilli()
+		member := fmt.Sprintf("%d:%d", now, i) // 唯一 member，避免同毫秒覆蓋
+		ok, _ := rlSlidingScript.Run(ctx, rdb, []string{key}, now, windowMs, limit, member).Int()
+		fmt.Printf("第 %d 次 → %s\n", i, allowStr(ok == 1))
+	}
+}
+
+// 14. 令牌桶：惰性補充（容量 5、每秒補 1），先吃掉攢的突發、之後回歸勻速
+var rlTokenScript = redis.NewScript(`
+local capacity = tonumber(ARGV[1])
+local rate     = tonumber(ARGV[2])
+local now      = tonumber(ARGV[3])
+local b = redis.call('HMGET', KEYS[1], 'tokens', 'ts')
+local tokens = tonumber(b[1]) or capacity
+local ts     = tonumber(b[2]) or now
+tokens = math.min(capacity, tokens + (now - ts) / 1000 * rate)  -- 依經過時間補充
+local allowed = 0
+if tokens >= 1 then tokens = tokens - 1; allowed = 1 end
+redis.call('HMSET', KEYS[1], 'tokens', tokens, 'ts', now)
+redis.call('PEXPIRE', KEYS[1], math.ceil(capacity / rate * 1000))
+return allowed`)
+
+func demoRLTokenBucket(ctx context.Context, rdb *redis.Client) {
+	fmt.Println("\n=== 14. 限流：令牌桶（容量 5、每秒補 1）===")
+	const key, capacity, rate = "rl:tb:u1", 5, 1
+	rdb.Del(ctx, key)
+	for i := 1; i <= 8; i++ {
+		now := time.Now().UnixMilli()
+		ok, _ := rlTokenScript.Run(ctx, rdb, []string{key}, capacity, rate, now).Int()
+		fmt.Printf("第 %d 次 → %s\n", i, allowStr(ok == 1))
+	}
+}
+
+func allowStr(ok bool) string {
+	if ok {
+		return "允許"
+	}
+	return "擋下"
 }
