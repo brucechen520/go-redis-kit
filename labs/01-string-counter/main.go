@@ -69,6 +69,10 @@ func main() {
 	demoRLFixedWindow(ctx, rdb)
 	demoRLSlidingWindow(ctx, rdb)
 	demoRLTokenBucket(ctx, rdb)
+
+	// 6. ZSet
+	demoZSetLeaderboard(ctx, rdb)
+	demoZSetDelayQueue(ctx, rdb)
 }
 
 // 1. 併發 INCR 證明原子性 ---------------------------------------------------
@@ -521,4 +525,64 @@ func allowStr(ok bool) string {
 		return "允許"
 	}
 	return "擋下"
+}
+
+// 15. ZSet：排行榜（ZADD/ZINCRBY/ZREVRANGE/ZREVRANK）--------------------------
+// 情境：遊戲排行榜、熱門排序。member=玩家、score=分數，按 score 排序。
+func demoZSetLeaderboard(ctx context.Context, rdb *redis.Client) {
+	fmt.Println("\n=== 15. ZSet：排行榜 ===")
+	const key = "game:leaderboard"
+	rdb.Del(ctx, key)
+	rdb.ZAdd(ctx, key,
+		redis.Z{Score: 1500, Member: "alice"},
+		redis.Z{Score: 2300, Member: "bob"},
+		redis.Z{Score: 1800, Member: "carol"},
+		redis.Z{Score: 900, Member: "dave"},
+	)
+	rdb.ZIncrBy(ctx, key, 500, "alice") // alice 加 500 → 2000
+
+	// Top 3（分數高到低，帶分數）
+	top, _ := rdb.ZRevRangeWithScores(ctx, key, 0, 2).Result()
+	fmt.Println("Top 3：")
+	for i, z := range top {
+		fmt.Printf("  #%d %s = %.0f\n", i+1, z.Member, z.Score)
+	}
+
+	// 查名次（ZRevRank 由高到低，0-based）+ 分數
+	rank, _ := rdb.ZRevRank(ctx, key, "alice").Result()
+	score, _ := rdb.ZScore(ctx, key, "alice").Result()
+	fmt.Printf("alice 第 %d 名（分數 %.0f）\n", rank+1, score)
+
+	// 分頁：第 2 頁、每頁 2 筆 = index 2~3
+	page2, _ := rdb.ZRevRange(ctx, key, 2, 3).Result()
+	fmt.Printf("第 2 頁（每頁 2 筆）= %v\n", page2)
+}
+
+// 16. ZSet：延遲隊列（score=執行時戳，撈到期任務）----------------------------
+// 情境：延遲任務、定時重試、訂單超時關閉。score=該執行的 unix 秒，
+// 週期性用 ZRANGEBYSCORE 0..now 撈到期的處理。
+func demoZSetDelayQueue(ctx context.Context, rdb *redis.Client) {
+	fmt.Println("\n=== 16. ZSet：延遲隊列（撈到期任務）===")
+	const key = "delay:queue"
+	rdb.Del(ctx, key)
+	now := time.Now()
+	rdb.ZAdd(ctx, key,
+		redis.Z{Score: float64(now.Add(-10 * time.Second).Unix()), Member: "job-past-1"},
+		redis.Z{Score: float64(now.Add(-2 * time.Second).Unix()), Member: "job-past-2"},
+		redis.Z{Score: float64(now.Add(30 * time.Second).Unix()), Member: "job-future"},
+	)
+
+	// 撈到期：score <= now
+	due, _ := rdb.ZRangeByScore(ctx, key, &redis.ZRangeBy{
+		Min: "0", Max: fmt.Sprintf("%d", now.Unix()),
+	}).Result()
+	fmt.Printf("到期任務（該執行）= %v\n", due)
+
+	// 執行完移除
+	if len(due) > 0 {
+		rdb.ZRem(ctx, key, due[0])
+		rest, _ := rdb.ZRange(ctx, key, 0, -1).Result()
+		fmt.Printf("執行並移除 %s；剩下 = %v\n", due[0], rest)
+	}
+	fmt.Println("（job-future 還沒到期不會被撈；多 worker 要用 Lua 原子撈+刪或 ZPOPMIN 防重複取）")
 }
