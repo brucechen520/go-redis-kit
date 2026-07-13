@@ -575,6 +575,20 @@ go-redis-kit/
 └── Makefile     ← 所有常用指令入口（make help 看全部）
 ```
 
+### docs 章節目錄
+
+| 章 | 檔案 | 主題 |
+| --- | --- | --- |
+| 00 | `00-environment.md` | 環境建置與心智模型（單線程 event loop、阻塞實驗）|
+| 01 | `01-datastructures.md` | 資料結構（String / Hash / List / Set / ZSet、編碼、實際情境）|
+| 02 | `02-expiry-eviction-memory.md` | 過期、淘汰策略、記憶體 |
+| 03 | `03-persistence.md` | 持久化（RDB / AOF）|
+| 04 | `04-ha-scaling.md` | 高可用與擴展（Sentinel / Cluster / 分片）|
+| 05 | `05-concurrency-primitives.md` | 併發原語（事務 / Lua / Pipeline / 分散式鎖 / fencing token）|
+| 06 | `06-application-patterns.md` | 應用層模式（快取三大問題 / 限流四算法 / 認證）|
+| 07 | `07-rediskit-production.md` | rediskit 封裝設計藍圖（生產化）|
+| 08 | `08-rate-limit-architecture.md` | 限流與異步架構（Redis + Kafka 分工、讀寫生命週期、四件套）|
+
 三個目錄的分工：
 
 | 目錄 | 放什麼 | 心態 |

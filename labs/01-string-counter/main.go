@@ -76,6 +76,9 @@ func main() {
 
 	// 7. 分散式鎖：fencing token
 	demoFencingToken(ctx, rdb)
+
+	// 8. Stream：可靠訊息佇列
+	demoStream(ctx, rdb)
 }
 
 // 1. 併發 INCR 證明原子性 ---------------------------------------------------
@@ -640,4 +643,89 @@ func acceptStr(ok bool) string {
 		return "接受寫入"
 	}
 	return "拒絕（舊 token）"
+}
+
+// 18. Stream：訂單事件可靠處理管線 ------------------------------------------
+// 真實情境：下單服務 XADD 訂單事件 → 計費(billing)、通知(notify) 兩個消費組
+// 各自收到全部事件（fan-out）。處理成功才 XACK；未 ack 的留在 PEL，consumer
+// 崩潰後由 XAUTOCLAIM 轉給健康的 worker 補做。業務用 order_id 去重（冪等）。
+//
+// 對照 docs/01 §5「List 佇列三級」：BRPOP 無 ack（崩潰掉訊息）< BLMOVE 可回收
+// < Stream（ack/PEL/XCLAIM/consumer group 全原生內建）。要可靠又省事就用 Stream。
+func demoStream(ctx context.Context, rdb *redis.Client) {
+	fmt.Println("\n=== 18. Stream：訂單事件可靠處理管線（ack + 崩潰回收 + fan-out）===")
+	const stream, dedupKey = "demo:orders", "demo:orders:dedup"
+	rdb.Del(ctx, stream, dedupKey)
+
+	// 兩個消費組：billing / notify → 各自收到全部事件（fan-out，互不影響）
+	rdb.XGroupCreateMkStream(ctx, stream, "billing", "0")
+	rdb.XGroupCreateMkStream(ctx, stream, "notify", "0")
+
+	// 下單服務寫 3 筆訂單事件（MAXLEN ~ 近似修剪，控制長度）
+	orders := []struct {
+		id     string
+		amount int
+	}{{"1001", 250}, {"1002", 990}, {"1003", 130}}
+	for _, o := range orders {
+		rdb.XAdd(ctx, &redis.XAddArgs{
+			Stream: stream, MaxLen: 100000, Approx: true,
+			Values: map[string]any{"order_id": o.id, "amount": o.amount},
+		})
+	}
+	fmt.Printf("下單服務寫入 3 筆訂單事件（XLEN=%d）\n", rdb.XLen(ctx, stream).Val())
+
+	// 計費 worker-1 消費新訊息 > → 冪等處理；故意漏 ack 最後一筆（模擬崩潰）
+	msgs, err := rdb.XReadGroup(ctx, &redis.XReadGroupArgs{
+		Group: "billing", Consumer: "worker-1",
+		Streams: []string{stream, ">"}, Count: 10,
+	}).Result()
+	if err != nil || len(msgs) == 0 {
+		fmt.Printf("XReadGroup 無訊息或出錯：%v\n", err)
+		return
+	}
+	list := msgs[0].Messages
+	for i, m := range list {
+		orderID, _ := m.Values["order_id"].(string)
+		if !billProcessed(ctx, rdb, dedupKey, orderID) { // order_id 去重
+			fmt.Printf("  billing/worker-1 計費 order=%s amount=%v\n", orderID, m.Values["amount"])
+		}
+		if i < len(list)-1 {
+			rdb.XAck(ctx, stream, "billing", m.ID) // 前兩筆正常 ack
+		} else {
+			fmt.Printf("  ✗ worker-1 處理 order=%s 後崩潰，來不及 XACK\n", orderID)
+		}
+	}
+
+	// 監控：XPENDING 看堆積（那筆沒 ack 的留在 PEL）
+	pend, _ := rdb.XPending(ctx, stream, "billing").Result()
+	fmt.Printf("  billing 待確認(PEL)= %d 筆\n", pend.Count)
+
+	// worker-2 回收 idle 訊息（示範 MinIdle=0 立即認領；生產設 60s）
+	claimed, _, _ := rdb.XAutoClaim(ctx, &redis.XAutoClaimArgs{
+		Stream: stream, Group: "billing", Consumer: "worker-2",
+		MinIdle: 0, Start: "0", Count: 10,
+	}).Result()
+	for _, m := range claimed {
+		fmt.Printf("  ✓ worker-2 認領並補計費 order=%s\n", m.Values["order_id"])
+		rdb.XAck(ctx, stream, "billing", m.ID)
+	}
+
+	// fan-out：notify 組獨立收到全部 3 筆（跟 billing 各拿全部、互不影響）
+	nmsgs, _ := rdb.XReadGroup(ctx, &redis.XReadGroupArgs{
+		Group: "notify", Consumer: "n1",
+		Streams: []string{stream, ">"}, Count: 10,
+	}).Result()
+	if len(nmsgs) > 0 {
+		fmt.Printf("  notify 組獨立收到 %d 筆（fan-out）\n", len(nmsgs[0].Messages))
+		for _, m := range nmsgs[0].Messages {
+			rdb.XAck(ctx, stream, "notify", m.ID)
+		}
+	}
+	fmt.Println("（重點：ack 才移出 PEL；崩潰未 ack 由 XAUTOCLAIM 回收；多組=fan-out）")
+}
+
+// billProcessed 用 Set 對 order_id 去重，回傳「之前是否已處理過」（冪等）。
+func billProcessed(ctx context.Context, rdb *redis.Client, dedupKey, orderID string) bool {
+	added, _ := rdb.SAdd(ctx, dedupKey, orderID).Result()
+	return added == 0 // 0 = 已存在（處理過）
 }
