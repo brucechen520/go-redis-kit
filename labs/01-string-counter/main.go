@@ -73,6 +73,9 @@ func main() {
 	// 6. ZSet
 	demoZSetLeaderboard(ctx, rdb)
 	demoZSetDelayQueue(ctx, rdb)
+
+	// 7. 分散式鎖：fencing token
+	demoFencingToken(ctx, rdb)
 }
 
 // 1. 併發 INCR 證明原子性 ---------------------------------------------------
@@ -585,4 +588,56 @@ func demoZSetDelayQueue(ctx context.Context, rdb *redis.Client) {
 		fmt.Printf("執行並移除 %s；剩下 = %v\n", due[0], rest)
 	}
 	fmt.Println("（job-future 還沒到期不會被撈；多 worker 要用 Lua 原子撈+刪或 ZPOPMIN 防重複取）")
+}
+
+// 17. Fencing token：防「過期持鎖者」亂寫共享資源 -----------------------------
+// 鎖過期後，舊持有者（GC 凍結後醒來）以為自己還持鎖、繼續寫 → 資料損毀。
+// 解法：發鎖時給單調遞增序號（INCR），資源端只收「比看過的最大值更大」的 token，
+// 舊 token 一律拒絕。擋住舊持有者的不是鎖，是資源端的序號檢查。
+//
+// 對照 docs/05 §5.5：fencing token = 分散式鎖的「版本號」，跟 token bucket（限流的
+// 「額度桶」）完全無關，只是名字都有 token。
+var fenceGuardScript = redis.NewScript(`
+local seen = tonumber(redis.call('GET', KEYS[1]) or '0')
+if tonumber(ARGV[1]) > seen then
+  redis.call('SET', KEYS[1], ARGV[1])   -- 記住新的最大 token
+  return 1                              -- 接受寫入
+end
+return 0                                -- 舊 token，拒絕
+`)
+
+func demoFencingToken(ctx context.Context, rdb *redis.Client) {
+	fmt.Println("\n=== 17. Fencing token（防過期持鎖者亂寫）===")
+	const seqKey = "lock:sla:fence:seq" // 發號器（INCR 產生單調遞增 token）
+	const guardKey = "resource:sla:max" // 資源端記錄「看過的最大 token」
+	rdb.Del(ctx, seqKey, guardKey)
+
+	// A 取得鎖 → 領一個 fencing token
+	tokenA, _ := rdb.Incr(ctx, seqKey).Result()
+	fmt.Printf("A 取得鎖，fencing token = %d\n", tokenA)
+
+	// A 業務卡住（GC 長暫停 / STW）→ 鎖 TTL 過期（此處直接讓 B 也能拿鎖）
+	fmt.Println("A 凍結中（GC pause）… 鎖 TTL 過期，watchdog 也一起被凍住")
+
+	// B 取得鎖 → 領到更大的 token
+	tokenB, _ := rdb.Incr(ctx, seqKey).Result()
+	fmt.Printf("B 取得鎖，fencing token = %d\n", tokenB)
+
+	// B 寫資源，帶新 token → 資源端記錄 max=B，接受
+	okB, _ := fenceGuardScript.Run(ctx, rdb, []string{guardKey}, tokenB).Int()
+	fmt.Printf("B 寫資源（token=%d）→ %s\n", tokenB, acceptStr(okB == 1))
+
+	// A 醒來，仍以為自己持鎖，帶舊 token 寫資源 → 被資源端拒絕
+	okA, _ := fenceGuardScript.Run(ctx, rdb, []string{guardKey}, tokenA).Int()
+	fmt.Printf("A 醒來寫資源（token=%d，舊）→ %s\n", tokenA, acceptStr(okA == 1))
+
+	fmt.Println("（關鍵：鎖擋不住已凍結的 A；擋住 A 的是資源端『只收更大 token』的檢查）")
+	fmt.Println("（實務多用冪等 / DB 唯一約束替代 fencing——下游能擋重複就不用改寫序號）")
+}
+
+func acceptStr(ok bool) string {
+	if ok {
+		return "接受寫入"
+	}
+	return "拒絕（舊 token）"
 }
