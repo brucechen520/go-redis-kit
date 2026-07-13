@@ -79,6 +79,12 @@ func main() {
 
 	// 8. Stream：可靠訊息佇列
 	demoStream(ctx, rdb)
+
+	// 9. 位圖 / 機率結構 / 地理空間
+	demoBitmap(ctx, rdb)
+	demoHLL(ctx, rdb)
+	demoGeo(ctx, rdb)
+	demoBitfield(ctx, rdb)
 }
 
 // 1. 併發 INCR 證明原子性 ---------------------------------------------------
@@ -728,4 +734,125 @@ func demoStream(ctx context.Context, rdb *redis.Client) {
 func billProcessed(ctx context.Context, rdb *redis.Client, dedupKey, orderID string) bool {
 	added, _ := rdb.SAdd(ctx, dedupKey, orderID).Result()
 	return added == 0 // 0 = 已存在（處理過）
+}
+
+// 19. Bitmap：日活 DAU + 連續活躍 + 月簽到卡 ---------------------------------
+// 真實情境：一個 user 一個 bit，海量布林狀態用極少記憶體（千萬 uid 日活 ≈ 1.25MB）。
+// 前提：uid 必須是密集自增整數，不能拿手機號/UUID/雪花 ID 當 offset（會撐爆記憶體）。
+func demoBitmap(ctx context.Context, rdb *redis.Client) {
+	fmt.Println("\n=== 19. Bitmap：日活 DAU + 連續活躍 + 月簽到卡 ===")
+	const d1, d2, both = "active:20260713", "active:20260714", "active:both"
+	const sign = "sign:u100:202607"
+	rdb.Del(ctx, d1, d2, both, sign)
+
+	// (1) 日活：uid 100/105/233/512 今天活躍 → 一個 bit 一人
+	for _, uid := range []int64{100, 105, 233, 512} {
+		rdb.SetBit(ctx, d1, uid, 1)
+	}
+	dau, _ := rdb.BitCount(ctx, d1, nil).Result()
+	fmt.Printf("7/13 DAU = %d\n", dau)
+
+	// (2) 連續兩天都活躍：BITOP AND 交集
+	for _, uid := range []int64{100, 233, 999} {
+		rdb.SetBit(ctx, d2, uid, 1)
+	}
+	rdb.BitOpAnd(ctx, both, d1, d2)
+	n, _ := rdb.BitCount(ctx, both, nil).Result()
+	fmt.Printf("連兩天都活躍 = %d 人（100、233）\n", n)
+
+	// (3) 月簽到卡：第 D 天簽到 → offset D-1（別差一）
+	for _, day := range []int64{1, 3, 7, 13} {
+		rdb.SetBit(ctx, sign, day-1, 1)
+	}
+	days, _ := rdb.BitCount(ctx, sign, nil).Result()
+	signedToday, _ := rdb.GetBit(ctx, sign, 13-1).Result()
+	fmt.Printf("u100 本月簽到 %d 天；今天(13號)已簽=%v\n", days, signedToday == 1)
+	fmt.Println("（記憶體由最大 offset 決定，非設了幾個 1；uid 稀疏就改用 Set）")
+}
+
+// 20. HyperLogLog：每日/每週 UV 估算 -----------------------------------------
+// 真實情境：只要「不重複數量」不要「名單」時，固定 ~12KB 估算任意規模基數，
+// 誤差 ±0.81%。1 億去重元素：Set 要數 GB，HLL 固定 12KB。
+func demoHLL(ctx context.Context, rdb *redis.Client) {
+	fmt.Println("\n=== 20. HyperLogLog：每日/每週 UV 估算 ===")
+	const d1, d2, week = "uv:20260713", "uv:20260714", "uv:week28"
+	rdb.Del(ctx, d1, d2, week)
+
+	// 當日訪客（含重複，自動去重）
+	rdb.PFAdd(ctx, d1, "u1", "u2", "u3", "u1", "u2")
+	uv1, _ := rdb.PFCount(ctx, d1).Result()
+	fmt.Printf("7/13 UV ≈ %d（送了 5 次含重複，去重估 3）\n", uv1)
+
+	rdb.PFAdd(ctx, d2, "u3", "u4", "u5")
+	// 週 UV：多 key 聯集去重（u3 跨日只算一次）
+	wk, _ := rdb.PFCount(ctx, d1, d2).Result()
+	fmt.Printf("兩日聯集 UV ≈ %d（u3 跨日只算一次）\n", wk)
+
+	// PFMERGE 成週 key 便於快取
+	rdb.PFMerge(ctx, week, d1, d2)
+	merged, _ := rdb.PFCount(ctx, week).Result()
+	fmt.Printf("PFMERGE 週 key ≈ %d（固定 ~12KB，不隨訪客數長）\n", merged)
+	fmt.Println("（只能算數量與聯集，不能列名單、不能算交集；估算值不可用於計費對帳）")
+}
+
+// 21. Geo：附近的騎手匹配 ----------------------------------------------------
+// 真實情境：底層是 ZSet（GeoHash 當 score），所以 ZSet 指令都能用。
+// 外送派單、附近的人、地理圍欄都是這招。
+func demoGeo(ctx context.Context, rdb *redis.Client) {
+	fmt.Println("\n=== 21. Geo：附近的騎手匹配 ===")
+	const key = "drivers:online"
+	rdb.Del(ctx, key)
+
+	// 騎手上線更新位置（注意順序：先經度 lon 後緯度 lat，寫反會跑到地球另一邊）
+	rdb.GeoAdd(ctx, key,
+		&redis.GeoLocation{Name: "driver-A", Longitude: 121.5654, Latitude: 25.0330},
+		&redis.GeoLocation{Name: "driver-B", Longitude: 121.5170, Latitude: 25.0478},
+		&redis.GeoLocation{Name: "driver-C", Longitude: 121.6000, Latitude: 25.1000},
+	)
+
+	// 餐廳座標 3km 內、最近的候選（ASC + COUNT，別漏 COUNT 否則回全部）
+	res, _ := rdb.GeoSearchLocation(ctx, key, &redis.GeoSearchLocationQuery{
+		GeoSearchQuery: redis.GeoSearchQuery{
+			Longitude: 121.55, Latitude: 25.04,
+			Radius: 3, RadiusUnit: "km", Sort: "ASC", Count: 20,
+		},
+		WithCoord: true, WithDist: true,
+	}).Result()
+	fmt.Printf("餐廳 3km 內候選 %d 名：\n", len(res))
+	for _, l := range res {
+		fmt.Printf("  %s  %.2fkm\n", l.Name, l.Dist)
+	}
+
+	// 派單給最近的 → 移出可派池（Geo 無 GEODEL，用 ZSet 的 ZREM）
+	if len(res) > 0 {
+		picked := res[0].Name
+		rdb.ZRem(ctx, key, picked)
+		left, _ := rdb.ZCard(ctx, key).Result()
+		fmt.Printf("派單給 %s，移出可派池；剩 %d 名在線\n", picked, left)
+	}
+	fmt.Println("（lon,lat 順序別寫反；刪點用 ZREM；全國規模按城市分 key 防 big key）")
+}
+
+// 22. Bitfield：用戶功能使用次數面板（記憶體極限優化）------------------------
+// 真實情境：多個小計數器打包在一個 key 的不同 bit 段，比多個 String key 省
+// key metadata；OVERFLOW SAT 讓計數封頂不溢位。只有記憶體真是瓶頸才值得（可讀性差）。
+func demoBitfield(ctx context.Context, rdb *redis.Client) {
+	fmt.Println("\n=== 22. Bitfield：用戶功能使用面板（8 功能打包一 key）===")
+	const key = "feat:u100:20260713"
+	rdb.Del(ctx, key)
+
+	// 功能 #0 點 3 次、#3 點 1 次（每個 u8 計數，SAT 防溢位）
+	for i := 0; i < 3; i++ {
+		rdb.BitField(ctx, key, "OVERFLOW", "SAT", "INCRBY", "u8", "#0", 1)
+	}
+	rdb.BitField(ctx, key, "OVERFLOW", "SAT", "INCRBY", "u8", "#3", 1)
+
+	// 飽和示範：#0 再加 300 → u8 封頂 255，不回繞
+	rdb.BitField(ctx, key, "OVERFLOW", "SAT", "INCRBY", "u8", "#0", 300)
+
+	// 一條指令原子取回全部欄位（#0~#3）
+	vals, _ := rdb.BitField(ctx, key,
+		"GET", "u8", "#0", "GET", "u8", "#1", "GET", "u8", "#2", "GET", "u8", "#3").Result()
+	fmt.Printf("功能使用面板 #0~#3 = %v（#0 飽和封頂 255）\n", vals)
+	fmt.Println("（8 功能打包一 key=8byte，省 key metadata；語意穩+記憶體瓶頸才用，否則 Hash 更好維運）")
 }
