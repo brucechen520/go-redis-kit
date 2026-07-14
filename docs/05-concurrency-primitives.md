@@ -929,6 +929,70 @@ func main() {
 
 ---
 
+### 5.10 別搞混層級：in-process 鎖 vs Redis 分散式鎖
+
+前面整章講的都是 **Redis 分散式鎖（跨進程 / 跨機器）**。但併發問題有**兩個不同層級**，用錯層級是常見面試陷阱：
+
+| 層級 | 問題 | 解法 | 例子 |
+|---|---|---|---|
+| **in-process**（同一進程多 goroutine） | 多 goroutine 併發存取同一份記憶體（如 `map`） | Go 的 `sync.Mutex` / `RWMutex` / `atomic` / **分片鎖** | 本機記憶體快取、計數器 |
+| **跨進程 / 跨機器** | 多個 pod / 服務搶同一個資源 | **Redis 分散式鎖**（本章）/ etcd / ZooKeeper | 定時任務單例、避免重複處理訂單 |
+
+**關鍵**：in-process 併發**不需要 Redis**——純 Go 記憶體同步就解決，還快幾個數量級（奈秒 vs 毫秒級的 Redis 往返）。反過來，Redis 鎖也管不到「單一進程內 goroutine 之間」的競爭。**先判斷是哪一層，別拿 Redis 鎖去解本機 map 併發（殺雞用牛刀 + 慢）。**
+
+#### in-process「讀多寫少」快取的三方案選型
+
+最經典的 in-process 情境：一個高頻讀的本機快取（如權限白名單），上萬讀 / 幾天一寫。三種做法：
+
+| 方案 | 讀 | 寫 | 何時選 |
+|---|---|---|---|
+| **`sync.RWMutex`** | 共享（多讀並行）| 獨佔 | 通用預設、簡單。高併發下單一 reader 計數器會成競爭點 |
+| **COW + `atomic.Value`** | **零鎖**（一次 atomic load）| 複製整表原子替換 | 純讀爆多、寫極稀有、表小。寫一多就崩（複製 O(N) + 記憶體翻倍）|
+| **分片鎖（sharded lock）** | 只鎖一片 | 只鎖一片 | **讀多寫少 + 高併發綜合最優**：讀的 reader 計數打散到 N 片、寫只鎖一片不擋其他片、不複製全表 |
+
+分片鎖骨架（map 切 N 片、各一把鎖、key hash 決定進哪片）：
+
+```go
+const shardCount = 256 // 2 的次方，用位遮罩取代取模
+
+type shard struct {
+	mu sync.RWMutex
+	m  map[string][]string
+}
+type ShardedCache struct{ shards [shardCount]shard }
+
+func (c *ShardedCache) shard(key string) *shard {
+	var h uint32 = 2166136261 // FNV-1a
+	for i := 0; i < len(key); i++ {
+		h ^= uint32(key[i]); h *= 16777619
+	}
+	return &c.shards[h&(shardCount-1)]
+}
+func (c *ShardedCache) Get(k string) ([]string, bool) {
+	s := c.shard(k); s.mu.RLock(); defer s.mu.RUnlock()
+	v, ok := s.m[k]; return v, ok
+}
+func (c *ShardedCache) Set(k string, v []string) {
+	s := c.shard(k); s.mu.Lock(); defer s.mu.Unlock()
+	s.m[k] = v
+}
+```
+
+一句話選型：
+```
+純讀爆多、寫幾乎沒有、表小   → COW（零鎖讀最快，但寫崩+吃記憶體）
+讀多寫少 + 高併發          → 分片鎖（綜合最優）★
+通用、圖簡單              → RWMutex（reader 計數在高併發是短板）
+寫多讀少                 → 樸素 Mutex（RWMutex 的 reader 計數反成浪費）或分片 Mutex
+純計數                   → atomic（無鎖）
+```
+
+> **和 Redis 的「分片」呼應**：分片思想在 Redis 也到處是——**分片計數器**避單 key 熱點（docs/01 §1）、**Redis Cluster hash slot**（16384 槽）把 key 分散到多節點。都是「把競爭 / 熱點打散到 N 份」的同一招，只是 in-process 分片打散**鎖競爭**、Redis 分片打散**單 key / 單節點壓力**。
+>
+> 完整可跑實作 + benchmark（RWMutex vs COW vs 分片鎖，含 1k~100k 分級併發壓測與數據）見另一 repo `go-60-days/interview/concurrent-cache`（`main.go` / `cache_test.go` / `notes.md`）。
+
+---
+
 ## 6. 選型建議
 
 1. **大多數業務**：單節點 `SET NX PX` 鎖 + watchdog 續期 + **業務層冪等兜底**。鎖負責「大幅降低」重複執行機率，冪等負責「萬一鎖失效也不出錯」。這是性價比最高的組合。
