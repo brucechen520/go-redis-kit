@@ -131,6 +131,100 @@ redis-cli --csv PSUBSCRIBE '__keyevent@0__:expired'
 >
 > 另一個限制：Keyspace notifications 走 Pub/Sub，是 **fire-and-forget**，沒有持久化、沒有 ACK。訂閱者當機期間錯過的事件不會補送。需要可靠事件流時，改用 Redis Stream。
 
+#### Go 範例：訂閱過期事件
+
+前提：redis 已 `CONFIG SET notify-keyspace-events Ex`（預設關閉，不開不會發事件）。
+
+```go
+// WatchExpired 訂閱 db 0 的過期事件；key 過期當下呼叫 onExpire。
+func WatchExpired(ctx context.Context, rdb *redis.Client, onExpire func(key string)) {
+	pubsub := rdb.PSubscribe(ctx, "__keyevent@0__:expired")
+	go func() {
+		defer pubsub.Close()
+		for msg := range pubsub.Channel() { // Channel() 內部自動重連 + buffer
+			onExpire(msg.Payload) // msg.Payload = 過期的 key 名
+		}
+	}()
+}
+
+// 用法：過期就清本地快取
+WatchExpired(ctx, rdb, func(key string) {
+	log.Printf("過期：%s", key)
+	localCache.Delete(key)
+})
+```
+
+`__keyevent@0__:expired` 的 `@0` 是 db 編號，`msg.Payload` 是過期的 key 名。若要盯特定 key 的所有事件，改訂 keyspace 頻道 `__keyspace@0__:<key>`（payload 變成事件名 `expired`）。
+
+#### 過期事件不可靠 → 三種補救
+
+過期事件**雙重不可靠**：(a) 發得不準（實際刪除才發，延遲數秒）(b) 收得會漏（fire-and-forget，訂閱者離線期間全丟）。所以**不能拿它當關鍵動作的唯一觸發**。要可靠有三條路線：
+
+| 路線 | 做法 | 適用 |
+|---|---|---|
+| **① 事件 + 兜底掃描** | 過期事件當「即時性優化」（收到就快點反應），另配一個**定期 worker 掃描**（掃 DB / ZSet 找「該處理但沒處理」的），漏掉的靠掃描補 | 想保留即時性、又不能漏 |
+| **② ZSet 延遲隊列**（不靠過期事件） | `ZADD delay:queue <到期時間戳> <任務>`，worker 定期 `ZRANGEBYSCORE 0 <now>` 撈到期項處理。精準（自控掃描頻率）、可靠（沒處理就一直在 ZSet）、可重放 | **要精準排程**（SLA 到期、定時任務）|
+| **③ Stream 可靠事件流** | 「該過期時」自己 `XADD` 寫進 Stream，consumer 用 group + `XACK` 消費。有持久化、ACK、重放、崩潰回收 | **要可靠事件**（訂單、金流）|
+
+一句話：keyspace 過期事件 = best-effort 通知，只當**優化**不當**保證**；要精準用 **ZSet 延遲隊列**，要可靠用 **Stream**。
+
+> **實例**：本 repo 對照的 SLA timer 系統走 ZSet（`sla:due_timers`，score=到期時間），**沒**用 keyspace 過期事件——因為 SLA 到期處理不能漏，這是路線 ②，選對了。
+
+---
+
+### 2.5 一般 Pub/Sub（發布訂閱）
+
+過期事件其實只是「Redis 幫你 PUBLISH 的一種 Pub/Sub」。一般 Pub/Sub 則是你自己發、自己訂。
+
+**本質**：即時廣播。發了就送給**當下在線**的訂閱者，沒在線就漏、無持久化、無 ACK、無回溯。
+
+#### 設定：不用開任何 config
+
+keyspace notification 才要 `notify-keyspace-events`；一般 Pub/Sub **直接發直接訂**：
+
+```bash
+# 訂閱端
+redis-cli SUBSCRIBE cache:invalidate
+# 另一個終端 發布端
+redis-cli PUBLISH cache:invalidate "user:100"
+```
+
+```go
+// 訂閱端（每個 pod 起一個）
+pubsub := rdb.Subscribe(ctx, "cache:invalidate")
+defer pubsub.Close()
+for msg := range pubsub.Channel() {
+	invalidateLocalCache(msg.Payload) // "user:100" → 清本地快取
+}
+
+// 發布端（更新 DB 後廣播）
+rdb.Publish(ctx, "cache:invalidate", "user:100")
+```
+
+- `SUBSCRIBE ch` 訂精確頻道；`PSUBSCRIBE ch:*` 訂 pattern（萬用字元）。
+- go-redis 的 `pubsub.Channel()` 回一個 Go channel，內部自動重連 + buffer。
+
+#### 什麼情境用（即時性 > 可靠性）
+
+| 情境 | 說明 |
+|---|---|
+| **多 pod 本地快取失效** | 一處更新 DB → `PUBLISH cache:invalidate <key>` → 所有 pod 收到清自己本地快取（呼應 docs/06 §2.4「本地快取靠 Pub/Sub 廣播失效」）|
+| **即時訊息推送 / 線上狀態** | 聊天、通知、presence |
+| **配置熱更新** | 配置變更廣播給所有實例 reload，不用重啟 |
+| **跨實例輕量信號** | 服務間即時通知「某事發生了」，不在乎歷史 |
+
+#### Pub/Sub vs Stream
+
+| | Pub/Sub | Stream |
+|---|---|---|
+| 交付 | fire-and-forget，在線才收 | 持久化，離線回來可補 |
+| ACK | 無 | `XACK` |
+| 重放 | 不行 | 可（`XRANGE` / 從任意 ID 重讀）|
+| 消費者崩潰 | 訊息永久漏 | 留 PEL，`XAUTOCLAIM` 回收 |
+| 成本 | 極省 | 較貴（ID / PEL / group 狀態）|
+
+**一句話**：Pub/Sub 即時但會漏（在線才收）；Stream 可靠可重放（離線回來還能補）。要可靠交付 / 重放 / ACK（訂單、金流、任務隊列）→ 一律用 Stream（docs/01 §6）或 Kafka（docs/08），別用 Pub/Sub。
+
 ---
 
 ## 3. 淘汰策略 `maxmemory-policy` 全解
