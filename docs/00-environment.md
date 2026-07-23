@@ -589,6 +589,14 @@ go-redis-kit/
 | 07 | `07-rediskit-production.md` | rediskit 封裝設計藍圖（生產化）|
 | 08 | `08-rate-limit-architecture.md` | 限流與異步架構（Redis + Kafka 分工、讀寫生命週期、四件套）|
 
+### labs 目錄（可跑 demo，`make lab N=...`）
+
+| lab | 目錄 | 對應章 | 主題 |
+| --- | --- | --- | --- |
+| 00 | `00-hello` | 00 | 連線、PING、SET/GET、`redis.Nil` |
+| 01 | `01-string-counter` | 01–06 | String 計數器 / Hash / List / Stream / Bitmap / HLL / Geo / Bitfield / fencing token |
+| 05 | `05-distributed-lock` | 05 | 分散式鎖：SET NX PX + Lua `Release`/`Refresh`（EVALSHA）+ fencing token；附 miniredis 測試（`make test`）|
+
 三個目錄的分工：
 
 | 目錄 | 放什麼 | 心態 |
