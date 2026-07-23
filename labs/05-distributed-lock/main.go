@@ -74,6 +74,94 @@ func main() {
 	l2, f2, _, _ := AcquireWithFence(ctx, rdb, key, "fence:demo", 5*time.Second)
 	_, _ = l2.Release(ctx)
 	fmt.Printf("fencing token: %d → %d （嚴格遞增，下游用它擋舊請求）\n", f1, f2)
+
+	// 6. §5.9 壓軸：100 goroutine 搶鎖驗互斥（+ watchdog 續命）
+	demoMutex100(ctx, rdb)
+}
+
+// demoMutex100 對應 docs/05 §5.9：100 個 goroutine 搶同一把鎖，對 counter 做「非原子的
+// 讀→加一→寫回」。鎖若真互斥，final 必精確等於 100；鎖失效則 < 100（丟失更新）。
+// 每把鎖配一個 watchdog（ticker ttl/3 呼叫 Refresh 續命），示範長任務不怕 TTL 到期。
+func demoMutex100(ctx context.Context, rdb *redis.Client) {
+	fmt.Println("\n=== §5.9 100 goroutine 搶鎖驗互斥 ===")
+	const lockKey, counterKey = "lock:counter", "app:counter"
+	rdb.Del(ctx, lockKey, counterKey)
+
+	const goroutines = 100
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+	for i := 0; i < goroutines; i++ {
+		go func() {
+			defer wg.Done()
+			// 每個 goroutine：自旋搶鎖 → watchdog 續命 → 非原子讀改寫 → 停 watchdog + 釋放
+			lock, err := spinAcquire(ctx, rdb, lockKey, 3*time.Second, 20*time.Millisecond)
+			if err != nil {
+				log.Printf("acquire: %v", err)
+				return
+			}
+			stop := startWatchdog(lock)
+			defer func() {
+				close(stop) // 先停 watchdog，才釋放（避免釋放後又續命）
+				if _, err := lock.Release(ctx); err != nil {
+					log.Printf("release: %v", err)
+				}
+			}()
+
+			// 臨界區：故意用「讀出→加一→寫回」的非原子序列；只有鎖真互斥，final 才會精確 100。
+			cur, _ := rdb.Get(ctx, counterKey).Int()
+			time.Sleep(time.Millisecond) // 放大競爭窗口
+			rdb.Set(ctx, counterKey, cur+1, 0)
+		}()
+	}
+	wg.Wait()
+
+	final, _ := rdb.Get(ctx, counterKey).Int()
+	fmt.Printf("final counter = %d (expect %d)\n", final, goroutines)
+	if final == goroutines {
+		fmt.Println("互斥成立 ✔")
+	} else {
+		fmt.Println("互斥被破壞（鎖有問題）！")
+	}
+}
+
+// spinAcquire 自旋搶鎖，直到成功或 ctx 取消。復用 lock.go 的 try-once Acquire，
+// 沒搶到就 select 退避（睡 retry，但 ctx 一取消立刻醒）—— 即「可取消的等待」。
+func spinAcquire(ctx context.Context, rdb *redis.Client, key string, ttl, retry time.Duration) (*Lock, error) {
+	for {
+		l, ok, err := Acquire(ctx, rdb, key, ttl)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			return l, nil
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(retry): // 稍等再搶，避免忙等
+		}
+	}
+}
+
+// startWatchdog 每 ttl/3 呼叫 Refresh 續命，回傳 stop channel；close(stop) 停止。
+// 續命失敗（鎖已丟失或被他人持有）也會自動停。
+func startWatchdog(l *Lock) chan struct{} {
+	stop := make(chan struct{})
+	go func() {
+		t := time.NewTicker(l.ttl / 3)
+		defer t.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-t.C:
+				if ok, err := l.Refresh(context.Background()); err != nil || !ok {
+					return // 鎖已非本人持有 → 停止續命
+				}
+			}
+		}
+	}()
+	return stop
 }
 
 func must(err error) {
