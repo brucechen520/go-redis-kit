@@ -39,6 +39,7 @@ func main() {
 	rdb.Del(ctx, key, "fence:demo")
 
 	// 1. 互斥：A 拿到，B 拿不到
+	fmt.Println("============ 1. 互斥：A 拿到，B 拿不到 start ============")
 	a, ok, err := Acquire(ctx, rdb, key, 10*time.Second)
 	must(err)
 	fmt.Printf("A 取鎖: %v (token=%s...)\n", ok, a.Token()[:8])
@@ -48,17 +49,20 @@ func main() {
 	fmt.Printf("B 取鎖: %v （預期 false，已被 A 持有）\n", ok2)
 
 	// 2. holder-safe 釋放：偽造的 token 釋放不掉
+	fmt.Println("============ 2. holder-safe 釋放：偽造的 token 釋放不掉 start ============")
 	fake := &Lock{rdb: rdb, key: key, token: "not-a-real-token", ttl: 10 * time.Second}
 	deleted, err := fake.Release(ctx)
 	must(err)
 	fmt.Printf("假 token 釋放: %v （預期 false，Lua 比對擋掉）\n", deleted)
 
 	// 3. Refresh 續命
+	fmt.Println("============ 3. Refresh 續命 start ============")
 	extended, err := a.Refresh(ctx)
 	must(err)
 	fmt.Printf("A 續命: %v\n", extended)
 
-	// 4. A 正常釋放，之後 B 才拿得到
+	// 4. A 正常釋放，之後 C 才拿得到
+	fmt.Println("============ 4. A 正常釋放，之後 C 才拿得到 start ============")
 	deleted, err = a.Release(ctx)
 	must(err)
 	fmt.Printf("A 釋放: %v\n", deleted)
@@ -69,6 +73,7 @@ func main() {
 	_, _ = c.Release(ctx)
 
 	// 5. fencing token：每次取鎖序號嚴格遞增
+	fmt.Println("============ 5. fencing token：每次取鎖序號嚴格遞增 start ============")
 	l1, f1, _, _ := AcquireWithFence(ctx, rdb, key, "fence:demo", 5*time.Second)
 	_, _ = l1.Release(ctx)
 	l2, f2, _, _ := AcquireWithFence(ctx, rdb, key, "fence:demo", 5*time.Second)
@@ -76,6 +81,7 @@ func main() {
 	fmt.Printf("fencing token: %d → %d （嚴格遞增，下游用它擋舊請求）\n", f1, f2)
 
 	// 6. §5.9 壓軸：100 goroutine 搶鎖驗互斥（+ watchdog 續命）
+	fmt.Println("============ 6. §5.9 壓軸：100 goroutine 搶鎖驗互斥（+ watchdog 續命） start ============")
 	demoMutex100(ctx, rdb)
 }
 
