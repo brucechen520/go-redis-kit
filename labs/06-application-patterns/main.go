@@ -5,8 +5,9 @@
 //     連 Redis 快取都不用碰。用 Redis bitmap（SETBIT/GETBIT）自己實作，免 RedisBloom 模組。
 //  3. 快取擊穿：互斥鎖重建（SET NX PX + Lua release），只讓一個請求查 DB 重建。
 //  4. 快取雪崩：TTL 抖動，讓大量 key 的到期時間錯開，不擠在同一時刻一起過期。
+//  5. 限流四算法：固定窗口 / 滑動窗口 / 令牌桶 / 漏桶（全用 Lua 原子化）。
 //
-// 對照 docs/06-application-patterns.md 快取三大問題 + 一致性。
+// 對照 docs/06-application-patterns.md 快取四大問題 + 限流四算法。
 //
 // 執行前先起 redis：make single-up
 // 執行：           go run ./labs/06-application-patterns
@@ -280,6 +281,145 @@ func demoAvalanche(ctx context.Context, rdb *redis.Client) {
 	fmt.Println("      抖動把過期攤平到一段區間，任一時刻只有少量 miss，DB 扛得住。")
 }
 
+// ────────────────────── 5. 限流四算法（Lua 原子）──────────────────────
+//
+// 限流 = 進入系統的第一道閘門，超額直接「拒絕」（非排隊）。四種算法各有取捨。
+// 全部用 Lua 讓「判斷 + 計數」原子化，避免併發下的競態。對照 docs/06 §3。
+
+// 5.1 固定窗口：INCR 計數，第一次設 EXPIRE 當窗口；超過 limit 拒絕。
+// 坑：窗口交界瞬間可過 2 倍量（邊界突刺）。
+var fixedWindowScript = redis.NewScript(`
+local c = redis.call("INCR", KEYS[1])
+if c == 1 then redis.call("EXPIRE", KEYS[1], ARGV[2]) end
+if c > tonumber(ARGV[1]) then return 0 else return 1 end`)
+
+func allowFixed(ctx context.Context, rdb *redis.Client, key string, limit, windowSec int) bool {
+	n, _ := fixedWindowScript.Run(ctx, rdb, []string{key}, limit, windowSec).Int()
+	return n == 1
+}
+
+// 5.2 滑動窗口（ZSet）：移除窗口外的時間戳，數剩幾筆；未滿才加入。精確、無邊界突刺。
+// 坑：存每筆請求的時間戳，較耗記憶體。
+var slidingWindowScript = redis.NewScript(`
+redis.call("ZREMRANGEBYSCORE", KEYS[1], 0, tonumber(ARGV[1]) - tonumber(ARGV[2]))
+if redis.call("ZCARD", KEYS[1]) < tonumber(ARGV[3]) then
+	redis.call("ZADD", KEYS[1], ARGV[1], ARGV[4])
+	redis.call("PEXPIRE", KEYS[1], ARGV[2])
+	return 1
+end
+return 0`)
+
+func allowSliding(ctx context.Context, rdb *redis.Client, key string, limit int, window time.Duration, member string) bool {
+	now := time.Now().UnixMilli()
+	n, _ := slidingWindowScript.Run(ctx, rdb, []string{key},
+		now, window.Milliseconds(), limit, member).Int()
+	return n == 1
+}
+
+// 5.3 令牌桶（★最推薦）：桶固定速率補 token，來請求拿一個。惰性補充——取的時候依時間差算該補多少。
+// 特點：容忍突發（桶有存量能一次噴一批）+ 平均限速。
+var tokenBucketScript = redis.NewScript(`
+local rate = tonumber(ARGV[1])   -- 每秒補幾個
+local cap  = tonumber(ARGV[2])   -- 桶容量
+local now  = tonumber(ARGV[3])   -- 現在(ms)
+local req  = tonumber(ARGV[4])   -- 這次要幾個
+local ttl  = tonumber(ARGV[5])
+local d = redis.call("HMGET", KEYS[1], "tokens", "ts")
+local tokens = tonumber(d[1])
+local ts = tonumber(d[2])
+if tokens == nil then tokens = cap; ts = now end       -- 第一次：滿桶
+local elapsed = (now - ts) / 1000
+tokens = math.min(cap, tokens + elapsed * rate)         -- 依時間差惰性補充
+local allowed = 0
+if tokens >= req then tokens = tokens - req; allowed = 1 end
+redis.call("HSET", KEYS[1], "tokens", tokens, "ts", now)
+redis.call("PEXPIRE", KEYS[1], ttl)
+return allowed`)
+
+func allowToken(ctx context.Context, rdb *redis.Client, key string, rate, capacity int) bool {
+	now := time.Now().UnixMilli()
+	n, _ := tokenBucketScript.Run(ctx, rdb, []string{key},
+		rate, capacity, now, 1, 3600000).Int()
+	return n == 1
+}
+
+// 5.4 漏桶（惰性水位）：請求進桶、固定速率漏出。水位到頂就拒。強制平滑輸出（不容突發）。
+var leakyBucketScript = redis.NewScript(`
+local leak = tonumber(ARGV[1])   -- 每秒漏幾個
+local cap  = tonumber(ARGV[2])   -- 桶容量
+local now  = tonumber(ARGV[3])
+local ttl  = tonumber(ARGV[4])
+local d = redis.call("HMGET", KEYS[1], "water", "ts")
+local water = tonumber(d[1])
+local ts = tonumber(d[2])
+if water == nil then water = 0; ts = now end
+local leaked = (now - ts) / 1000 * leak                 -- 依時間差惰性漏水
+water = math.max(0, water - leaked)
+local allowed = 0
+if water + 1 <= cap then water = water + 1; allowed = 1 end
+redis.call("HSET", KEYS[1], "water", water, "ts", now)
+redis.call("PEXPIRE", KEYS[1], ttl)
+return allowed`)
+
+func allowLeaky(ctx context.Context, rdb *redis.Client, key string, leak, capacity int) bool {
+	now := time.Now().UnixMilli()
+	n, _ := leakyBucketScript.Run(ctx, rdb, []string{key},
+		leak, capacity, now, 3600000).Int()
+	return n == 1
+}
+
+func demoRateLimit(ctx context.Context, rdb *redis.Client) {
+	fmt.Println("\n==== 5. 限流四算法 ====")
+	rdb.Del(ctx, "rl:fixed", "rl:sliding", "rl:token", "rl:leaky")
+
+	// 5.1 固定窗口：limit 5/60s，瞬間打 8 次
+	pass := 0
+	for i := 0; i < 8; i++ {
+		if allowFixed(ctx, rdb, "rl:fixed", 5, 60) {
+			pass++
+		}
+	}
+	fmt.Printf("5.1 固定窗口 limit=5/60s，打 8 次 → 通過 %d、拒絕 %d\n", pass, 8-pass)
+
+	// 5.2 滑動窗口：limit 5/60s，member 需唯一
+	pass = 0
+	for i := 0; i < 8; i++ {
+		member := strconv.Itoa(int(time.Now().UnixNano())) + "-" + strconv.Itoa(i)
+		if allowSliding(ctx, rdb, "rl:sliding", 5, 60*time.Second, member) {
+			pass++
+		}
+	}
+	fmt.Printf("5.2 滑動窗口 limit=5/60s，打 8 次 → 通過 %d、拒絕 %d（精確、無邊界突刺）\n", pass, 8-pass)
+
+	// 5.3 令牌桶：cap 5, rate 1/s。瞬間打 8 次 → 桶存量 5 一次噴出
+	pass = 0
+	for i := 0; i < 8; i++ {
+		if allowToken(ctx, rdb, "rl:token", 1, 5) {
+			pass++
+		}
+	}
+	fmt.Printf("5.3 令牌桶 cap=5 rate=1/s，瞬間打 8 次 → 通過 %d（容忍突發，桶存量一次放）\n", pass)
+	time.Sleep(2 * time.Second) // 等 2 秒補 2 個 token
+	pass = 0
+	for i := 0; i < 3; i++ {
+		if allowToken(ctx, rdb, "rl:token", 1, 5) {
+			pass++
+		}
+	}
+	fmt.Printf("    等 2 秒補 token 後打 3 次 → 通過 %d（惰性補充後可再過）\n", pass)
+
+	// 5.4 漏桶：cap 5, leak 1/s。瞬間打 8 次 → 水位到頂就拒
+	pass = 0
+	for i := 0; i < 8; i++ {
+		if allowLeaky(ctx, rdb, "rl:leaky", 1, 5) {
+			pass++
+		}
+	}
+	fmt.Printf("5.4 漏桶 cap=5 leak=1/s，瞬間打 8 次 → 通過 %d（水位到頂即拒，強制平滑）\n", pass)
+
+	fmt.Println("選型：通用首選令牌桶（容忍突發）；要平穩輸出對下游友善用漏桶；要精確用滑動窗口；最簡固定窗口。")
+}
+
 // ────────────────────────────── main ──────────────────────────────
 
 func env(key, def string) string {
@@ -374,4 +514,7 @@ func main() {
 
 	// ===== 4. 快取雪崩：TTL 抖動 =====
 	demoAvalanche(ctx, rdb)
+
+	// ===== 5. 限流四算法 =====
+	demoRateLimit(ctx, rdb)
 }
