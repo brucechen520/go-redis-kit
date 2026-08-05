@@ -33,3 +33,13 @@ make single-down
 `make help` 看全部指令。
 
 > ⚠️ redis 綁 `127.0.0.1` 且設了密碼。
+
+## 測試
+
+```bash
+make test    # go test ./...
+```
+
+單元測試跑在 [miniredis](https://github.com/alicebob/miniredis) `v2.33.0`（純 Go 記憶體版 Redis），**不需要 Docker**。miniredis v2.33.0 的行為對齊 **Redis 7.2.4**。
+
+需要真的 Redis 時（labs、手動驗證）用 `docker-compose.yml` 的 `redis:7` image，實測版本 **7.4.9**。
