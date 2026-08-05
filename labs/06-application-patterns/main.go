@@ -6,8 +6,10 @@
 //  3. 快取擊穿：互斥鎖重建（SET NX PX + Lua release），只讓一個請求查 DB 重建。
 //  4. 快取雪崩：TTL 抖動，讓大量 key 的到期時間錯開，不擠在同一時刻一起過期。
 //  5. 限流四算法：固定窗口 / 滑動窗口 / 令牌桶 / 漏桶（全用 Lua 原子化）。
+//  6. Token / 認證：session token / JWT 黑名單 / refresh 輪換 + 重放偵測。
+//  7. 熔斷 + 降級：Redis 共享的分散式熔斷器（三態）+ fail fast 回退降級值。
 //
-// 對照 docs/06-application-patterns.md 快取四大問題 + 限流四算法。
+// 對照 docs/06-application-patterns.md 快取 + 限流 + 認證 + 穩定性四件套。
 //
 // 執行前先起 redis：make single-up
 // 執行：           go run ./labs/06-application-patterns
@@ -420,6 +422,163 @@ func demoRateLimit(ctx context.Context, rdb *redis.Client) {
 	fmt.Println("選型：通用首選令牌桶（容忍突發）；要平穩輸出對下游友善用漏桶；要精確用滑動窗口；最簡固定窗口。")
 }
 
+// ────────────────────── 6. Token / 認證 ──────────────────────
+//
+// 三種模式：有狀態 session（可即時撤銷）、JWT 黑名單（補「JWT 簽發後無法作廢」）、
+// refresh 輪換 + 重放偵測（防 refresh token 被盜）。對照 docs/06 §4。
+
+// 6.1 Session token：token → userID 存 Redis + TTL。登入寫、驗證查、登出刪。
+func login(ctx context.Context, rdb *redis.Client, token, userID string) {
+	rdb.Set(ctx, "session:"+token, userID, 7*24*time.Hour)
+}
+
+func verifySession(ctx context.Context, rdb *redis.Client, token string) (string, bool) {
+	v, err := rdb.Get(ctx, "session:"+token).Result()
+	if err != nil {
+		return "", false // redis.Nil（已登出/過期）或故障
+	}
+	return v, true
+}
+
+func logout(ctx context.Context, rdb *redis.Client, token string) {
+	rdb.Del(ctx, "session:"+token)
+}
+
+// 6.2 JWT 黑名單：JWT 無狀態不能撤銷 → 撤銷時把 jti 加進黑名單，TTL = token 剩餘壽命。
+func revokeJWT(ctx context.Context, rdb *redis.Client, jti string, remaining time.Duration) {
+	rdb.Set(ctx, "jwt:blacklist:"+jti, 1, remaining) // TTL=剩餘壽命，過期自動清
+}
+
+func isJWTRevoked(ctx context.Context, rdb *redis.Client, jti string) bool {
+	n, _ := rdb.Exists(ctx, "jwt:blacklist:"+jti).Result()
+	return n == 1
+}
+
+// 6.3 Refresh 輪換 + 重放偵測：每次刷新「刪舊發新」（原子）。舊 token 又被用 → 偵測到重放（被盜）。
+// GET 舊 token == userID → 刪舊、發新、回 1；否則（已被用過/無效）回 0 = 重放訊號。
+var rotateRefreshScript = redis.NewScript(`
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+	redis.call("DEL", KEYS[1])
+	redis.call("SET", KEYS[2], ARGV[1], "EX", ARGV[2])
+	return 1
+else
+	return 0
+end`)
+
+func rotateRefresh(ctx context.Context, rdb *redis.Client, oldTok, newTok, userID string, ttlSec int) bool {
+	n, _ := rotateRefreshScript.Run(ctx, rdb,
+		[]string{"refresh:" + oldTok, "refresh:" + newTok}, userID, ttlSec).Int()
+	return n == 1
+}
+
+func demoAuth(ctx context.Context, rdb *redis.Client) {
+	fmt.Println("\n==== 6. Token / 認證 ====")
+	rdb.Del(ctx, "session:tk-abc", "jwt:blacklist:jti-1",
+		"refresh:rt-aaa", "refresh:rt-bbb", "refresh:rt-ccc")
+
+	// 6.1 Session token
+	login(ctx, rdb, "tk-abc", "user-7")
+	_, ok := verifySession(ctx, rdb, "tk-abc")
+	fmt.Printf("6.1 session：登入後驗證 → 有效=%v\n", ok)
+	logout(ctx, rdb, "tk-abc")
+	_, ok = verifySession(ctx, rdb, "tk-abc")
+	fmt.Printf("    登出後驗證 → 有效=%v（有狀態 session 可即時撤銷）\n", ok)
+
+	// 6.2 JWT 黑名單
+	fmt.Printf("6.2 JWT：撤銷前 jti-1 被撤銷=%v\n", isJWTRevoked(ctx, rdb, "jti-1"))
+	revokeJWT(ctx, rdb, "jti-1", time.Hour) // 假設 token 還剩 1 小時
+	fmt.Printf("    撤銷後 jti-1 被撤銷=%v（無狀態 JWT 靠黑名單補撤銷能力）\n", isJWTRevoked(ctx, rdb, "jti-1"))
+
+	// 6.3 Refresh 輪換 + 重放偵測
+	rdb.Set(ctx, "refresh:rt-aaa", "user-7", 7*24*time.Hour) // 發 refresh token rt-aaa
+	ok1 := rotateRefresh(ctx, rdb, "rt-aaa", "rt-bbb", "user-7", 604800)
+	fmt.Printf("6.3 refresh：rt-aaa 輪換成 rt-bbb → 成功=%v（舊的已刪）\n", ok1)
+	replay := rotateRefresh(ctx, rdb, "rt-aaa", "rt-ccc", "user-7", 604800)
+	fmt.Printf("    攻擊者拿舊 rt-aaa 再輪換 → 成功=%v（false = 偵測到重放，該 user 全部 token 應作廢告警）\n", replay)
+}
+
+// ────────────────────── 7. 熔斷 + 降級 ──────────────────────
+//
+// 穩定性四件套的另兩件（限流的隊友）。熔斷/降級本質是應用層邏輯，單機常用 in-process
+// (gobreaker)；這裡做 Redis 共享版，讓「多實例共用同一個熔斷狀態」。
+//
+// 熔斷三態：Closed(正常放行) → 連續失敗達門檻 → Open(斷開，直接 fail fast) →
+//           冷卻期過 → Half-Open(放一個試探) → 成功回 Closed、失敗再 Open。
+// 降級 = 熔斷中或呼叫失敗時，回退到預設值(fallback)，不讓錯誤往上炸、也不再打掛掉的下游。
+
+// cbFailScript：記一次失敗；連續失敗達門檻 → 開熔斷(SET open EX cooldown)並清計數。
+var cbFailScript = redis.NewScript(`
+local f = redis.call("INCR", KEYS[1])
+redis.call("EXPIRE", KEYS[1], ARGV[2])
+if f >= tonumber(ARGV[1]) then
+	redis.call("SET", KEYS[2], 1, "EX", ARGV[3])
+	redis.call("DEL", KEYS[1])
+	return 1
+end
+return 0`)
+
+type CircuitBreaker struct {
+	rdb       *redis.Client
+	name      string
+	threshold int // 連續失敗幾次熔斷
+	failWin   int // 失敗計數窗口(秒)
+	cooldown  int // 熔斷持續(秒)
+}
+
+func (cb *CircuitBreaker) openKey() string { return "cb:" + cb.name + ":open" }
+func (cb *CircuitBreaker) failKey() string { return "cb:" + cb.name + ":failures" }
+
+// allow：open key 不存在才放行（存在 = 熔斷中）。
+func (cb *CircuitBreaker) allow(ctx context.Context) bool {
+	n, _ := cb.rdb.Exists(ctx, cb.openKey()).Result()
+	return n == 0
+}
+func (cb *CircuitBreaker) onSuccess(ctx context.Context) { cb.rdb.Del(ctx, cb.failKey()) }
+func (cb *CircuitBreaker) onFailure(ctx context.Context) {
+	cbFailScript.Run(ctx, cb.rdb, []string{cb.failKey(), cb.openKey()},
+		cb.threshold, cb.failWin, cb.cooldown)
+}
+
+// Call：熔斷中直接降級（連 fn 都不呼叫）；否則呼叫 fn，失敗也降級並記一次失敗。
+func (cb *CircuitBreaker) Call(ctx context.Context, fn func() (string, error), fallback string) (string, bool) {
+	if !cb.allow(ctx) {
+		return fallback, false // 熔斷中 → fail fast，保護下游
+	}
+	v, err := fn()
+	if err != nil {
+		cb.onFailure(ctx)
+		return fallback, false // 這次失敗 → 降級
+	}
+	cb.onSuccess(ctx)
+	return v, true
+}
+
+func demoCircuitBreaker(ctx context.Context, rdb *redis.Client) {
+	fmt.Println("\n==== 7. 熔斷 + 降級 ====")
+	rdb.Del(ctx, "cb:payment:open", "cb:payment:failures")
+	cb := &CircuitBreaker{rdb: rdb, name: "payment", threshold: 3, failWin: 10, cooldown: 2}
+
+	var calls int64
+	failing := func() (string, error) {
+		atomic.AddInt64(&calls, 1) // 記下游「真的被呼叫」幾次
+		return "", errors.New("downstream down")
+	}
+
+	// 打 6 次：前 3 次真呼叫(失敗)，第 3 次觸發熔斷 → 後面 fail fast 不再呼叫下游
+	for i := 1; i <= 6; i++ {
+		_, ok := cb.Call(ctx, failing, "DEFAULT")
+		fmt.Printf("  第 %d 次：ok=%v（下游已被打 %d 次）\n", i, ok, atomic.LoadInt64(&calls))
+	}
+	fmt.Printf("→ 下游掛掉，只被打 %d 次就熔斷，其餘 fail fast 回降級值 DEFAULT，保護下游不被繼續打\n",
+		atomic.LoadInt64(&calls))
+
+	// 冷卻 2 秒後 half-open：下游恢復
+	time.Sleep(2100 * time.Millisecond)
+	recovered := func() (string, error) { atomic.AddInt64(&calls, 1); return "REAL", nil }
+	v, ok := cb.Call(ctx, recovered, "DEFAULT")
+	fmt.Printf("  冷卻後試探：ok=%v 回傳=%q（half-open 放行，成功 → 熔斷關閉、恢復正常）\n", ok, v)
+}
+
 // ────────────────────────────── main ──────────────────────────────
 
 func env(key, def string) string {
@@ -517,4 +676,10 @@ func main() {
 
 	// ===== 5. 限流四算法 =====
 	demoRateLimit(ctx, rdb)
+
+	// ===== 6. Token / 認證 =====
+	demoAuth(ctx, rdb)
+
+	// ===== 7. 熔斷 + 降級 =====
+	demoCircuitBreaker(ctx, rdb)
 }
