@@ -30,8 +30,8 @@ tidy:
 test:           ## 全單測 (用 miniredis, 免 docker)
 	go test ./...
 
-bench:          ## 跑 benchmark
-	go test -bench=. -benchmem ./...
+bench:          ## 跑 benchmark (只跑 bench, 不重跑單測)
+	go test -bench=. -benchmem -run='^$$' ./...
 
 # 跑某個 lab: make lab N=05-distributed-lock
 lab:

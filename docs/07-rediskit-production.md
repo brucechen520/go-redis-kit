@@ -3,9 +3,10 @@
 > Stage 7 的目標：把前面各階段（cache-aside、分散式鎖、rate limit、token store…）散落的實作，收斂成一個**可重用、可測試、可上線**的內部函式庫 `rediskit/`，並補齊生產環境需要的可觀測性、連線池調參、重試退避與優雅降級。
 >
 > 模組：`github.com/twteam/go-redis-kit` · Go 1.26.1 · client `github.com/redis/go-redis/v9`
-> 相依：`golang.org/x/sync/singleflight`（併發回源合併）、`github.com/alicebob/miniredis/v2`（單測）、`github.com/go-redsync/redsync/v4`（分散式鎖基礎）
+> 相依：`golang.org/x/sync/singleflight`（併發回源合併）、`github.com/alicebob/miniredis/v2`（單測）
+> （原規劃的 `redsync` 不採用：部署形態是單一邏輯 Redis，redlock quorum 用不上；自刻版收編 labs/05，保得住 fencing token 且 Lua 集中 `script.go` 可 review）
 >
-> ⚠️ 本文件只**解釋設計與用法**，`rediskit/*.go` 由另一位負責實作。閱讀本文時把它當成 spec 與 code review 的對照標準。
+> ⚠️ 本文件是 spec 與 code review 的對照標準。`rediskit/*.go` 已實作；與本文不一致處以 §8 的「實作備註」為準。
 
 ---
 
@@ -88,16 +89,18 @@ Stage 7 要交付的心智模型：
 
 ```
 rediskit/
-├── client.go       連線建立與生命週期
-├── options.go      functional options 設定
-├── serializer.go   序列化抽象與 JSON 預設實作
-├── keys.go         key 命名規範 (KeyBuilder)
-├── errors.go       語意化錯誤 (哨兵 error)
-├── script.go       Lua 腳本集中管理 (redis.NewScript)
-├── cache.go        Cache: GetOrLoad / cache-aside + singleflight
-├── lock.go         Locker: 分散式鎖 (redsync 封裝)
-├── ratelimit.go    RateLimiter: 令牌桶 / 滑動視窗 (Lua)
-└── tokenstore.go   TokenStore: refresh token / session 儲存
+├── client.go         連線建立與生命週期
+├── options.go        functional options 設定
+├── serializer.go     序列化抽象與 JSON 預設實作
+├── keys.go           key 命名規範 (KeyBuilder: Build 組段跳脫 / Qualify 補 namespace)
+├── errors.go         語意化錯誤 (哨兵 error) + MapError / MapNotFound
+├── script.go         Lua 腳本集中管理 (redis.NewScript)
+├── cache.go          Cache: GetOrLoad / cache-aside + singleflight
+├── lock.go           Locker: 分散式鎖 (自刻 SET NX PX + Lua CAS + fencing)
+├── ratelimit.go      RateLimiter: 令牌桶 (Lua)
+├── tokenstore.go     TokenStore: token 儲存 + 原子輪替 (CAS)
+├── observability.go  MetricsRecorder interface + go-redis Hook
+└── escape.go         Raw() 逃生艙 (意圖 API 外的 Redis 能力)
 ```
 
 逐檔職責：
@@ -124,7 +127,7 @@ rediskit/
 `Cache.GetOrLoad(ctx, key, dst, loader, ttl)`：cache-aside + singleflight + TTL 抖動 + 語意化 miss。是全 lib 最常用的型別。
 
 ### `lock.go` — 分散式鎖
-封裝 `redsync`：`Obtain(ctx, name, ttl)` 回傳 `*Lock`，`lock.Release(ctx)`，可選 auto-renew（watchdog）。把 redsync 的細節藏起來，只暴露 `Obtain/Release`。
+收編 labs/05 的自刻實作：`Obtain(ctx, name, ttl)` 回傳 `*Lock`（SET NX PX），`Release`/`Refresh` 走 Lua CAS（比對 token 才動手），`ObtainWithFence` 附單調遞增 fencing token。鎖已不是你的時回 `ErrLockLost`——這是正確性信號（臨界區可能已與別人並行），不是可忽略的細節。watchdog 自動續命不內建，`Refresh` 手動呼叫。
 
 ### `ratelimit.go` — 限流
 `RateLimiter.Allow(ctx, key)` / `AllowN(ctx, key, n)`。底層走 `script.go` 的 Lua（令牌桶或滑動視窗），保證判斷+扣減原子。
@@ -250,6 +253,11 @@ if errors.Is(err, rediskit.ErrCacheMiss) {
 }
 ```
 
+> **實作備註**：實際哨兵比上面多兩個。`ErrCanceled`——`context.Canceled` 不併入 `ErrTimeout`：
+> 取消是「上游不要了」，逾時是「Redis 慢」，混在一起會讓 client 斷線灌爆逾時指標、
+> 還可能誤觸熔斷。`ErrLockLost`——`Release`/`Refresh` 時鎖已非己有（見 `lock.go`）。
+> 另外除 `redis.Nil` 外的映射都用 `%w` 保留原因鏈，`errors.Is` 對哨兵與底層錯誤都成立。
+
 ### 4.6 Functional options
 
 設定用 functional options，而非一個巨大的 config struct 或超長參數列。可選、有預設、向後相容。
@@ -315,6 +323,14 @@ func (c *cache) GetOrLoad(ctx context.Context, key string, dst any,
 ```
 
 > 注意：`singleflight` 只在**單一 process 內**合併。跨 process 的擊穿仍要靠分散式鎖或 TTL 抖動緩解。兩者可疊加。
+
+> **實作備註**：上面的示意有一個併發雷——closure 抓的 `ctx` 是「第一個進 flight 的呼叫端」的，
+> 它一取消，loader 跟著死，**所有排隊等結果的人陪葬**。實際實作改用 `sf.DoChan` +
+> `context.WithoutCancel` + 獨立 `WithLoadTimeout`：回源的壽命與任何單一呼叫端脫鉤，
+> 每個等待者 `select` 自己的 `ctx.Done()` 決定等多久（自己取消自己走，flight 照跑照回填）。
+> 另外 `GetOrLoad` 是 package-level 泛型函式而非方法（Go 方法不能有型別參數），
+> `assign(dst, v)` 的 reflect 賦值換成編譯期型別安全；flight 內先重查一次快取再回源。
+> 回填失敗不擋請求，但記 `cache_backfill` 錯誤指標，不靜默。
 
 ### 4.8 key 命名規範 `namespace:entity:id`
 
@@ -758,21 +774,30 @@ func main() {
 
 ## 8. 交付物 checklist
 
-- [ ] `rediskit/` 十個檔案齊備，公開 API 皆為 interface 或封裝結構，**無任何 `*redis.Client` 外漏**。
-- [ ] 每個碰網路的方法第一參數為 `ctx`，且真的往下傳。
-- [ ] `Serializer` 可透過 `WithSerializer` 抽換；JSON 為預設。
-- [ ] 所有 key 經 `KeyBuilder`，格式 `namespace:entity:id`，無手拼字串。
-- [ ] 語意化 error 完整（`ErrCacheMiss`/`ErrLockNotObtained`/`ErrRateLimited`/`ErrTokenNotFound`/`ErrTimeout`），並有 `mapErr` 把 `redis.Nil` 等映射掉。
-- [ ] 多步原子操作全走 `script.go` 的 `redis.NewScript`。
-- [ ] `Cache.GetOrLoad` 具備 singleflight 併發合併 + TTL 抖動。
-- [ ] Metrics Hook（命中率/延遲/錯誤）與 Tracing Hook（OTel）可透過 options 掛上。
-- [ ] 連線池與分層超時（dial/read/write + PoolTimeout）可設定，有合理預設。
-- [ ] 重試策略明確：冪等操作才重試；鎖/限流/token 降級為 fail-close。
-- [ ] 降級路徑：cache fail-open（回 DB），安全型 fail-close，有註解說明。
-- [ ] miniredis 單測涵蓋 cache/keys/serializer/errors；`FastForward` 測 TTL。
-- [ ] `//go:build integration` 整合測涵蓋 Lua/cluster；`go test ./...` 預設只跑單測。
-- [ ] benchmark（`make bench`）有覆蓋 GetOrLoad hit/miss，回報 `allocs/op`。
-- [ ] `Client.Close()` 正確釋放連線池；`New` 失敗不外洩資源。
+勾選狀態 = 目前 `rediskit/` 實作現況。與原規劃不同處標 **（實作差異）** 並附理由。
+
+- [x] `rediskit/` 檔案齊備（12 檔，含追加的 `observability.go`、`escape.go`），公開 API 皆為封裝結構，業務碼無 `*redis.Client` 外漏。
+  - **（實作差異）** 新增 `Client.Raw()` 逃生艙：意圖 API 涵蓋不了的能力（bitmap、Stream、SCAN、pipeline…）走它，至少共享連線池與觀測 Hook。規則從「無任何外漏」改為「**業務碼禁止直接呼叫 `Raw()`**；要用就包進自己的基礎設施型別，每個呼叫點需 code review」。
+- [x] 每個碰網路的方法第一參數為 `ctx`，且真的往下傳。
+  - **（實作差異）** 唯一例外刻意設計：`GetOrLoad` 的回源 loader 用 `context.WithoutCancel` + `WithLoadTimeout` 的獨立壽命——flight 結果是所有等待者共享的，不能綁在第一個呼叫端的 ctx 上（見 §4.7 實作備註）。
+- [x] `Serializer` 可透過 `WithSerializer` 抽換；JSON 為預設。
+- [x] 所有 key 經 `KeyBuilder`，格式 `namespace:entity:id`，無手拼字串。
+  - **（實作差異）** `KeyBuilder` 拆成兩個動詞：`Build`（組多段，段內 `:`/`%` 跳脫防碰撞）與 `Qualify`（補 namespace，不跳脫）。lib 內各模組用 `Qualify` 加模組前綴（`lock:`/`rl:`/`token:`），呼叫端組動態 id 用 `Build`。namespace 統一小寫，各段保留大小寫（id/token 大小寫敏感）。
+- [x] 語意化 error 完整，`MapError`/`MapNotFound` 把 `redis.Nil` 等映射掉。
+  - **（實作差異）** 哨兵是 8 個不是 5 個：追加 `ErrCanceled`（取消 ≠ 逾時，混了會污染逾時指標與熔斷判斷）、`ErrLockLost`（`Release`/`Refresh` 時鎖已非己有——正確性信號，取代原本 lab 05 的 `(bool, error)` 匿名回傳）、`ErrClosed`。除 `redis.Nil` 外映射保留 `%w` 原因鏈。
+- [x] 多步原子操作全走 `script.go` 的 `redis.NewScript`（lock release/refresh、令牌桶、token rotate 四段）。腳本決定性：時間由 Go 端經 ARGV 傳入，測試可注入假時鐘（`WithTimeSource`）。
+- [x] `GetOrLoad` 具備 singleflight 併發合併 + TTL 抖動（[90%, 110%)）。
+  - **（實作差異）** 是 package-level 泛型函式非方法；`DoChan` 版本修掉 §4.7 原示意的 ctx 陪葬雷。
+- [x] Metrics Hook（命中率/延遲/錯誤）可透過 `WithMetrics` 掛上；`redis.Nil` 不算錯誤。
+  - **（實作差異）** Tracing Hook（OTel）**未實作**：不想把 `go.opentelemetry.io` 拉進相依。要 tracing 用官方 `redisotel` 掛在 `Raw()` 上，一行搞定。
+- [x] 連線池與分層超時（dial/read/write + PoolTimeout）可設定，零值交給 go-redis 預設。
+- [x] 重試策略：沿用 go-redis 內建連線層重試（`WithMaxRetries`）；鎖/限流/token 不自行重試，fail-close 交上層決定。
+- [x] 降級路徑：cache 讀寫錯誤原樣回傳（fail-open 回 DB 是**呼叫端**的決定，lib 不越權替你打 DB）；安全型 fail-close，註解寫在各型別 doc comment。
+- [x] miniredis 單測 68 個涵蓋全部模組；`FastForward` 測 TTL/鎖過期，假時鐘測限流補充，零 `time.Sleep`。
+- [ ] `//go:build integration` 整合測涵蓋 Lua/cluster 真實行為；`go test ./...` 預設只跑單測。（未做：Lua 腳本目前靠 miniredis 驗，真 Redis 行為差異待補）
+- [x] benchmark（`make bench`）覆蓋 GetOrLoad hit/miss、KeyBuilder、限流、鎖，回報 `allocs/op`。
+- [x] `Client.Close()` 釋放連線池，之後操作回 `ErrClosed`。
+- [ ] watchdog 自動續命 goroutine。（未做：`Refresh` 手動版已提供；自動版牽涉 goroutine 生命週期管理，需要時再加）
 
 ---
 
