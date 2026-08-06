@@ -76,6 +76,10 @@ if err := rl.Allow(ctx, "login:user:123"); errors.Is(err, rediskit.ErrRateLimite
 - **`ErrTimeout` ≠ `ErrCanceled`**：前者是 Redis/網路慢（該告警），後者是呼叫端不要了（不該觸發降級）。
 - **意圖 API 沒涵蓋的**（bitmap、Stream、SCAN…）走 `client.Raw()` 逃生艙——業務碼禁用，包在自己的基礎設施型別裡再用。
 
+## Example
+
+完整逐步範例見 **[docs/example.md](docs/09-rediskit-example.md)**：連線調參、Cache/GetOrLoad、8 個哨兵錯誤的處理方式、鎖（含 watchdog 續命與 fencing token）、限流 middleware、refresh token 輪替、metrics 掛載、`Raw()` 使用守則、用 miniredis + 假時鐘測你自己的業務碼。每個範例都附「實際情境」說明用在系統的哪個位置。
+
 ## 測試
 
 ```bash
