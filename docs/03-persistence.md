@@ -1,6 +1,6 @@
 # Stage 3：持久化與耐久性（Persistence & Durability）
 
-> 模組：`github.com/twteam/go-redis-kit`　·　Go 1.26.1　·　client：`github.com/redis/go-redis/v9`
+> 模組：`github.com/brucechen520/go-redis-kit`　·　Go 1.26.1　·　client：`github.com/redis/go-redis/v9`
 > 本階段對應 `docker-compose.yml` 的 `single` profile（`redis:7`，已開 `--appendonly yes`）。
 
 ---

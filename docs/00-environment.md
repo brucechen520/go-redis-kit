@@ -24,7 +24,7 @@
 | Go 基礎語法 | 寫 demo 程式 | 會 struct / error 處理 / `go run` 就夠 |
 | TCP / client-server 概念 | 理解連線池、RESP | 知道「client 送 request，server 回 response」即可 |
 
-本 repo 環境：模組 `github.com/twteam/go-redis-kit`，Go **1.26.1**，客戶端函式庫 `github.com/redis/go-redis/v9`，Redis 伺服器版本 **7.x**。
+本 repo 環境：模組 `github.com/brucechen520/go-redis-kit`，Go **1.26.1**，客戶端函式庫 `github.com/redis/go-redis/v9`，Redis 伺服器版本 **7.x**。
 
 ---
 

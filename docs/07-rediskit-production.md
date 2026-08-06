@@ -2,7 +2,7 @@
 
 > Stage 7 的目標：把前面各階段（cache-aside、分散式鎖、rate limit、token store…）散落的實作，收斂成一個**可重用、可測試、可上線**的內部函式庫 `rediskit/`，並補齊生產環境需要的可觀測性、連線池調參、重試退避與優雅降級。
 >
-> 模組：`github.com/twteam/go-redis-kit` · Go 1.26.1 · client `github.com/redis/go-redis/v9`
+> 模組：`github.com/brucechen520/go-redis-kit` · Go 1.26.1 · client `github.com/redis/go-redis/v9`
 > 相依：`golang.org/x/sync/singleflight`（併發回源合併）、`github.com/alicebob/miniredis/v2`（單測）
 > （原規劃的 `redsync` 不採用：部署形態是單一邏輯 Redis，redlock quorum 用不上；自刻版收編 labs/05，保得住 fencing token 且 Lua 集中 `script.go` 可 review）
 >
@@ -686,7 +686,7 @@ import (
     "log"
     "time"
 
-    "github.com/twteam/go-redis-kit/rediskit"
+    "github.com/brucechen520/go-redis-kit/rediskit"
 )
 
 func main() {

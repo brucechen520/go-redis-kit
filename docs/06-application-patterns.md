@@ -1,6 +1,6 @@
 # Stage 6：應用層設計模式（Application Patterns）
 
-> 模組：`github.com/twteam/go-redis-kit`　Go 1.26.1　Client：`github.com/redis/go-redis/v9`　輔助：`golang.org/x/sync/singleflight`
+> 模組：`github.com/brucechen520/go-redis-kit`　Go 1.26.1　Client：`github.com/redis/go-redis/v9`　輔助：`golang.org/x/sync/singleflight`
 >
 > 本階段大量重用 Stage 5 打造的分散式鎖（下文以 `lock.Mutex` 泛稱，對應 `rediskit.Lock`）。若你尚未讀完 Stage 5，請先回頭補齊「SET NX PX + Lua 安全解鎖 + fencing token」的觀念，再回來。
 

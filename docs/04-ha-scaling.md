@@ -1,6 +1,6 @@
 # Stage 4：高可用與擴展（HA & Scaling）
 
-> 模組：`github.com/twteam/go-redis-kit`｜Go 1.26.1｜client：`github.com/redis/go-redis/v9`
+> 模組：`github.com/brucechen520/go-redis-kit`｜Go 1.26.1｜client：`github.com/redis/go-redis/v9`
 > 對應 compose profiles：`sentinel`、`cluster`（`make sentinel-up` / `make cluster-up` / `make cluster-init`）
 
 ---

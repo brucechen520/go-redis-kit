@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/twteam/go-redis-kit/rediskit"
+	"github.com/brucechen520/go-redis-kit/rediskit"
 )
 
 func TestTokenSaveLoad_RoundTrips(t *testing.T) {

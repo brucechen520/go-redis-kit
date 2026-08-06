@@ -3,7 +3,7 @@ package rediskit_test
 import (
 	"testing"
 
-	"github.com/twteam/go-redis-kit/rediskit"
+	"github.com/brucechen520/go-redis-kit/rediskit"
 )
 
 func TestBuild_PrependsNamespace(t *testing.T) {

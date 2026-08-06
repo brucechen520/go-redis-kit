@@ -1,6 +1,6 @@
 # Stage 2：過期 (Expiry)、淘汰 (Eviction) 與記憶體 (Memory)
 
-> 模組：`github.com/twteam/go-redis-kit` ｜ Go 1.26.1 ｜ Client：`github.com/redis/go-redis/v9`
+> 模組：`github.com/brucechen520/go-redis-kit` ｜ Go 1.26.1 ｜ Client：`github.com/redis/go-redis/v9`
 >
 > 本文承接 Stage 1，聚焦 Redis 如何「讓 key 消失」與「在記憶體不足時做取捨」。這兩件事看起來是兩個獨立主題，實際上緊密相連：TTL 決定 key「應該」何時消失，過期機制決定 key「實際」何時被清掉，而淘汰策略決定「記憶體真的滿了、又沒東西自然過期」時該犧牲誰。理解這條鏈路，是把 Redis 從「會用」變成「敢在正式環境用」的關鍵。
 

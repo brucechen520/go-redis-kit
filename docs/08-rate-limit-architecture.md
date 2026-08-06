@@ -1,6 +1,6 @@
 # Stage 8：限流與異步架構（Rate Limiting & Async Architecture）
 
-> 模組：`github.com/twteam/go-redis-kit`　Go 1.26.1　Client：`github.com/redis/go-redis/v9` + Kafka（`segmentio/kafka-go` 或 `confluent-kafka-go`）
+> 模組：`github.com/brucechen520/go-redis-kit`　Go 1.26.1　Client：`github.com/redis/go-redis/v9` + Kafka（`segmentio/kafka-go` 或 `confluent-kafka-go`）
 >
 > 本章把 docs/06 §3 的限流演算法「拉高到架構層」：Redis 與 Kafka 在一條完整請求路徑上各自的定位、讀寫兩條路的生命週期、以及穩定性四件套的分工。演算法細節（token bucket / 漏桶 Lua）請回 docs/06 §3；分散式鎖與冪等請回 docs/05 §5。
 

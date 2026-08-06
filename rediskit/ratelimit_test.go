@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/twteam/go-redis-kit/rediskit"
+	"github.com/brucechen520/go-redis-kit/rediskit"
 )
 
 // fakeClock 是可手動快轉的時間來源。限流的令牌補充以它為準，

@@ -13,7 +13,7 @@
 ### 最小版
 
 ```go
-import "github.com/twteam/go-redis-kit/rediskit"
+import "github.com/brucechen520/go-redis-kit/rediskit"
 
 client, err := rediskit.New(
     rediskit.WithAddr("localhost:6379"),

@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/twteam/go-redis-kit/rediskit"
+	"github.com/brucechen520/go-redis-kit/rediskit"
 )
 
 var benchUser = user{ID: "1", Name: "Ada", Age: 36}

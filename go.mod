@@ -1,4 +1,4 @@
-module github.com/twteam/go-redis-kit
+module github.com/brucechen520/go-redis-kit
 
 go 1.26.1
 

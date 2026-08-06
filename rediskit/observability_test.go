@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/twteam/go-redis-kit/rediskit"
+	"github.com/brucechen520/go-redis-kit/rediskit"
 )
 
 // fakeRecorder 只「記」狀態，斷言全部拉回 test body 主線做。

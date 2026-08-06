@@ -1,6 +1,6 @@
 # Stage 1：Redis 資料結構全解
 
-> 模組：`github.com/twteam/go-redis-kit`｜Go 1.26.1｜Client：`github.com/redis/go-redis/v9`
+> 模組：`github.com/brucechen520/go-redis-kit`｜Go 1.26.1｜Client：`github.com/redis/go-redis/v9`
 >
 > 本文件是 Redis 十大資料結構的深度學習與參考資料。每個結構都依照固定模板拆解：
 > **指令清單 → 底層編碼（含轉碼門檻 config）→ 時間複雜度 → 使用情境 → 踩坑清單 → redis-cli 範例 → Go 範例 → 專案流程說明**。

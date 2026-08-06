@@ -1,6 +1,6 @@
 # Stage 5：並發原語 — 事務、Lua、Pipeline、分散式鎖
 
-> 模組：`github.com/twteam/go-redis-kit` · Go 1.26.1 · 客戶端 `github.com/redis/go-redis/v9` v9.7.0 · 分散式鎖 `github.com/go-redsync/redsync/v4` v4.13.0
+> 模組：`github.com/brucechen520/go-redis-kit` · Go 1.26.1 · 客戶端 `github.com/redis/go-redis/v9` v9.7.0 · 分散式鎖 `github.com/go-redsync/redsync/v4` v4.13.0
 
 ---
 
